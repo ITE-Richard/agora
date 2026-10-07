@@ -653,7 +653,8 @@ def cmd_install(ws: Workspace, args):
     def agy_permissions(data):
         allow = data.setdefault("permissions", {}).setdefault("allow", [])
         for rule in (f"command({AGORA_CMD} quota)", f"command({AGORA_CMD} check)", "command(git status)",
-                     "command(git diff)", "command(git log)", f"write_file({ws.root})", f"write_file({ws.root.as_posix()})"):
+                     "command(git diff)", "command(git log)", f"write_file({ws.root})", f"write_file({ws.root.as_posix()})",
+                     f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:
                 allow.append(rule)
     _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
