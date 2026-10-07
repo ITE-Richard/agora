@@ -1,34 +1,37 @@
 ---
 name: agora
-description: 與 Claude Code（Anthropic 的 agent）透過 Agora 工具進行多輪技術討論，或接續 Claude Code 發起的討論串。當使用者要求「跟 Claude 討論」「問問 Claude」「讓你們討論」或提到 Agora 討論串時使用。
+description: 透過 Agora 與 Claude Code、Codex 進行多輪技術討論、分派工作，或接續其他 AI 發起的討論串。當使用者要求「跟 Claude／Codex 討論」「問問其他 AI」「讓你們討論」「分工完成」或提到 Agora 討論串時使用。
 ---
 
-# Agora：與 Claude Code 討論
+# Agora：與 Claude Code、Codex 討論與分工
 
-工具：`python tools/agora/agora.py`（說明見 tools/agora/README.md）。
-每個討論串在 `discussions/<id>/`，`transcript.md` 是給 Richard 看的逐字稿。
+工具：`python D:/github/agora/agora.py`（說明：D:/github/agora/README.md）。討論串在工作區的 `.agora/threads/<id>/`，
+`transcript.md` 是給使用者看的逐字稿。
 
-## 發起新討論
+## 發起討論
 
-1. 先自己讀相關程式碼，整理出立場與依據，不要把未查證的說法丟給對方。
-2. 建立討論串並送出開場（Windows PowerShell 範例）：
+1. 先自己讀相關程式碼，整理出立場與依據。
+2. 建立討論串並送出開場（PowerShell；訊息較長時先寫成檔案改用 `--file`）：
 
 ```powershell
-$T = python tools/agora/agora.py new "主題"
-python tools/agora/agora.py send $T --from antigravity --message "開場內容：背景、你的立場、具體想請對方回應的問題（引用 檔案:行號）"
+$T = python D:/github/agora/agora.py new "主題"
+python D:/github/agora/agora.py send $T --from antigravity --file 開場.md
 ```
 
-訊息較長時，先寫到暫存檔，改用 `--file <路徑>`。
+`send --from antigravity` 預設依序請其他所有 AI 回覆；`--to claude` 只請 Claude。
 
-3. 指令會直接印出 Claude Code 的回覆（可能需要 10 秒到數分鐘）。查證回覆中的論點後，再用 `send $T --from antigravity` 回應。
-4. 重複直到收斂。預設最多 4 來回，除非使用者另有指定。對方寫出「【已達成共識】」，或雙方只剩立場差異、沒有新論點時就停止。
+3. 查證回覆後再回應；出現「【已達成共識】」或只剩立場差異時停止。
 
-## 接續 Claude Code 發起的討論
+## 分派工作
 
-`python tools/agora/agora.py list` 找到討論串，`show <id>` 讀完整內容，再用 `send <id> --from antigravity` 回覆。
+```powershell
+python D:/github/agora/agora.py assign $T --from antigravity --to claude --file 工作單.md
+python D:/github/agora/agora.py status $T --wait 900
+```
+
+完成後逐項審查接手方的 git diff 並跑驗證。
 
 ## 規則
 
-- 用 `--from antigravity` 發言。不要用 `auto` 指令代替自己思考；只在使用者要求「讓它們自己討論」時使用。
-- 討論期間不修改程式碼；需要修改時，結束討論後先向使用者回報再動手。
-- 結束後向使用者回報：共識、仍有分歧的點（雙方各自理由）、建議的下一步，並附上 transcript.md 的路徑。
+- 用 `--from antigravity` 發言。討論期間不改程式碼；結束後向使用者回報共識、分歧與下一步。
+- 其他 AI 的說法一律先查證。

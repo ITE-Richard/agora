@@ -1,9 +1,9 @@
 """
-額度提醒 hook：讀快取（必要時在背景更新），把雙方剩餘額度與交接指示注入給 agent。
+額度提醒 hook：讀快取（必要時在背景更新），把三方剩餘額度與交接指示注入給 agent。
 
-  python tools/agora/quota_hook.py claude-prompt   # Claude Code UserPromptSubmit：每次都附一行額度
-  python tools/agora/quota_hook.py claude-tool     # Claude Code PostToolUse：只在需要交接/停工時提醒
-  python tools/agora/quota_hook.py agy-pre         # Antigravity PreInvocation：首次呼叫附額度，需要時提醒
+  python <agora>/agoralib/quota_hook.py claude-prompt   # Claude Code UserPromptSubmit：每次都附一行額度
+  python <agora>/agoralib/quota_hook.py claude-tool     # Claude Code PostToolUse：只在需要交接/停工時提醒
+  python <agora>/agoralib/quota_hook.py agy-pre         # Antigravity PreInvocation：首次呼叫附額度，需要時提醒
 
 只讀檔案、不做網路請求，確保 hook 本身很快；快取過期時另開背景程序更新。
 """
@@ -11,14 +11,13 @@
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import quota  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from agoralib import quota  # noqa: E402
 
 STATE_FILE = quota.AGORA_HOME / "hook_state.json"
-NAMES = {"claude": "Claude", "antigravity": "Antigravity"}
+NAMES = quota.LABELS
 
 
 def load_state() -> dict:
@@ -31,8 +30,7 @@ def save_state(state: dict):
 
 def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
     """回傳 (提醒等級, 指示文字)；等級用來避免同一個重置週期內重複提醒"""
-    other = "antigravity" if me == "claude" else "claude"
-    mine, theirs = usages[me], usages[other]
+    mine = usages.get(me)
     if not quota.low(mine):
         return None, None
     if os.getenv("AGORA_INVOKED"):
@@ -40,19 +38,23 @@ def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
         return f"worker-{mine.get('resets_at')}", (
             f"⚠️ 你（{NAMES[me]}）的額度剩 {mine['remaining_pct']:.0f}%。完成目前這一小步後，"
             f"把交接說明寫進進度檔，回覆最後一行寫「【額度不足】」並結束。")
-    if quota.low(theirs):
-        my_reset, their_reset = mine.get("resets_at"), (theirs or {}).get("resets_at")
-        hand_off = bool(their_reset and my_reset and their_reset < my_reset)
-        return f"both-{my_reset}", (
-            f"⚠️ {NAMES[me]} 與 {NAMES[other]} 額度都低於 {quota.THRESHOLD_PCT:.0f}%，停止手邊工作。"
-            + (f"{NAMES[other]} 較早重置（{quota.fmt_time(their_reset)}），依 relay skill 仍交接給它；接手程序會等它額度重置後才開始。"
-               if hand_off else "依 relay skill 把目前進度寫進 Agora 討論串，不要交接。")
+    others = {p: u for p, u in usages.items() if p != me and u}
+    healthy = {p: u for p, u in others.items() if not quota.low(u)}
+    my_reset = mine.get("resets_at")
+    if not healthy:
+        earliest = min(others.items(), key=lambda kv: kv[1].get("resets_at") or float("inf"), default=(None, {}))
+        party, u = earliest
+        hand_off = bool(party and u.get("resets_at") and my_reset and u["resets_at"] < my_reset)
+        return f"all-{my_reset}", (
+            f"⚠️ 所有 AI 的額度都低於 {quota.THRESHOLD_PCT:.0f}%，停止手邊工作。"
+            + (f"{NAMES[party]} 最早重置（{quota.fmt_time(u['resets_at'])}），依 relay skill 仍交接給它；"
+               f"接手程序會等它額度重置後才開始。" if hand_off else "依 relay skill 把目前進度寫進 Agora 討論串，不要交接。")
             + f"安排自己在 {quota.fmt_time(my_reset)} 重置後喚醒，然後停止工作。")
-    return f"self-{mine.get('resets_at')}", (
-        f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(mine.get('resets_at'))} 重置），"
-        f"{NAMES[other]} 尚有 {theirs['remaining_pct']:.0f}%。" if theirs else
-        f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(mine.get('resets_at'))} 重置）。"
-    ) + f"立即依 relay skill 把手邊工作交接給 {NAMES[other]}，安排自己在重置後喚醒，然後停止工作。"
+    best = max(healthy, key=lambda p: healthy[p]["remaining_pct"])
+    return f"self-{my_reset}", (
+        f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
+        f"{NAMES[best]} 尚有 {healthy[best]['remaining_pct']:.0f}%。"
+        f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}，安排自己在重置後喚醒，然後停止工作。")
 
 
 def main():
@@ -66,9 +68,9 @@ def main():
     except Exception:
         payload = {}
 
-    usages = {"claude": quota.claude_usage(), "antigravity": quota.antigravity_usage()}
+    usages = quota.all_usage()
     max_age = quota.wanted_max_age(*usages.values())
-    if any(quota.is_stale(u, max_age) for u in usages.values()):
+    if any(quota.is_stale(usages[p], max_age) for p in ("claude", "antigravity")):
         quota.refresh_in_background()
 
     me = "antigravity" if mode.startswith("agy") else "claude"

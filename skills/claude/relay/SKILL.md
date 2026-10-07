@@ -6,7 +6,7 @@ description: 額度快用完時把工作交接給 Antigravity、重置後收回�
 # Relay：額度交接
 
 每次使用者送出訊息，hook 會附上一行【額度】（Claude 與 Antigravity 的剩餘量與重置時間）。
-額度低於 5% 時，hook 會加上 ⚠️ 指示。隨時可用 `python tools/agora/quota.py` 查詢。
+額度低於 5% 時，hook 會加上 ⚠️ 指示。隨時可用 `python D:/github/agora/agora.py quota` 查詢。
 
 ## A. 自己不足、Antigravity 足夠：交接
 
@@ -18,7 +18,7 @@ description: 額度快用完時把工作交接給 Antigravity、重置後收回�
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `new` 一個）：
    ```bash
-   python tools/agora/agora.py relay <thread> --from claude --file <交接單路徑>
+   python D:/github/agora/agora.py relay <thread> --from claude --file <交接單路徑>
    ```
 4. 安排自己在重置後喚醒：用 CronCreate 建立一次性排程，時間設在 Claude 重置時間後 3 分鐘，prompt 寫：
    `額度已重置：依 relay skill 的 C 段收回 <thread> 的工作並繼續。`
@@ -31,15 +31,15 @@ description: 額度快用完時把工作交接給 Antigravity、重置後收回�
 
 ## C. 喚醒後收回
 
-1. `python tools/agora/agora.py recall <thread>`
-2. `python tools/agora/agora.py relay-status <thread> --wait 900`（Bash timeout 設 960000），等接手方停在檢查點。
-3. 讀 `discussions/<thread>/progress.md` 和 `git diff`，**逐項查證**接手方的改動：
+1. `python D:/github/agora/agora.py recall <thread>`
+2. `python D:/github/agora/agora.py status <thread> --wait 900`（Bash timeout 設 960000），等接手方停在檢查點。
+3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`，**逐項查證**接手方的改動：
    - 有沒有超出交接範圍
    - 測試是否通過
 4. 向使用者簡短回報接手期間的進度與發現的問題，再從進度檔的「下一步」繼續原本的工作。
 
 ## 注意
 
-- 接手方的界線寫在 `tools/agora/agora.py` 的 WORK_PREAMBLE：只改交接範圍、不 commit/push、不碰 .env、不跑 main.py 或下單。
-- 狀態 `failed`：讀 `discussions/<thread>/worker.log` 找原因，回報使用者。
+- 接手方的界線寫在 `D:/github/agora/agoralib/cli.py` 的 WORK_PREAMBLE：只改工作單範圍、不 commit/push、不碰 .env、不做影響外部系統的動作。
+- 狀態 `failed`：讀 `.agora/threads/<thread>/worker.log` 找原因，回報使用者。
 - 不要用 relay 處理實盤交易或任何不可逆的操作。

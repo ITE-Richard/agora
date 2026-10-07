@@ -3,7 +3,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python D:/github/Taixu/tools/agora/quota_hook.py agy-pre",
+        "command": "python D:/github/agora/agoralib/quota_hook.py agy-pre",
         "timeout": 15
       }
     ]
