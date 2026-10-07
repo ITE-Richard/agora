@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from agoralib import quota
-from agoralib.parties import (AGORA_CMD, AI_PARTIES, CALLERS, HUMAN, NAMES, NESTED_ENV, CallError, canonical)
+from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
+                              NESTED_ENV, CallError, canonical)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -596,6 +597,88 @@ def cmd_quota(ws: Workspace, args):
     quota.main(args.rest)
 
 
+def _merge_json(path: Path, update) -> dict:
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            sys.exit(f"{path} 不是合法的 JSON，請先修正。")
+    update(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return data
+
+
+def cmd_install(ws: Workspace, args):
+    """把 Agora 裝進工作區：三方使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設驗證設定"""
+    import shutil
+    root = AGORA_ROOT_DIR
+    hook = f"python {(root / 'agoralib' / 'quota_hook.py').as_posix()}"
+    done = []
+
+    for agent, dest in (("claude", ws.root / ".claude" / "skills"), ("antigravity", ws.root / ".agents" / "skills")):
+        for skill in ("agora", "relay"):
+            target = dest / skill
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / "skills" / agent / skill / "SKILL.md", target / "SKILL.md")
+        done.append(f"{agent} skills → {dest}")
+
+    # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
+    agents_md = ws.root / "AGENTS.md"
+    section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
+    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+    text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
+        if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
+    agents_md.write_text(text.rstrip() + "\n", encoding="utf-8")
+    done.append(f"Codex 說明 → {agents_md}")
+
+    def claude_hooks(data):
+        hooks = data.setdefault("hooks", {})
+        for event, mode, matcher in (("UserPromptSubmit", "claude-prompt", None), ("PostToolUse", "claude-tool", "*")):
+            groups = [g for g in hooks.get(event, []) if "quota_hook.py" not in json.dumps(g)]
+            group = {"hooks": [{"type": "command", "command": f"{hook} {mode}", "timeout": 15}]}
+            if matcher:
+                group["matcher"] = matcher
+            hooks[event] = groups + [group]
+    _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks)
+    done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
+
+    def agy_hooks(data):
+        data["agora-quota"] = {"PreInvocation": [{"type": "command", "command": f"{hook} agy-pre", "timeout": 15}]}
+    _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
+    done.append("Antigravity hook → .agents/hooks.json")
+
+    # Antigravity CLI 的權限是全域、完整比對：只開放接手方需要的固定指令與此工作區的寫入
+    def agy_permissions(data):
+        allow = data.setdefault("permissions", {}).setdefault("allow", [])
+        for rule in (f"command({AGORA_CMD} quota)", f"command({AGORA_CMD} check)", "command(git status)",
+                     "command(git diff)", "command(git log)", f"write_file({ws.root})", f"write_file({ws.root.as_posix()})"):
+            if rule not in allow:
+                allow.append(rule)
+    _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
+    done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
+
+    gitignore = ws.root / ".gitignore"
+    lines = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
+    for entry in (".agora/", ".claude/settings.local.json"):
+        if entry not in lines:
+            lines.append(entry)
+    gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    done.append(".gitignore 加入 .agora/、.claude/settings.local.json")
+
+    config = ws.home / "config.json"
+    if not config.exists():
+        ws.home.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"check": DEFAULT_CHECK}, indent=2) + "\n", encoding="utf-8")
+        done.append(f"預設驗證設定 → {config}")
+
+    print(f"已將 Agora 安裝到 {ws.root}：")
+    for d in done:
+        print(f"  • {d}")
+    print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+
+
 def add_message_args(p):
     p.add_argument("--message")
     p.add_argument("--file")
@@ -662,6 +745,9 @@ def main(argv=None):
     p = sub.add_parser("quota", help="三方剩餘額度（--refresh、--json）")
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_quota)
+
+    p = sub.add_parser("install", help="把 Agora 裝進工作區（skills、hooks、權限、.gitignore）")
+    p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("_work", help=argparse.SUPPRESS)
     p.add_argument("thread")
