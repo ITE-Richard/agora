@@ -18,9 +18,11 @@ description: 額度快用完時把工作交接給還有額度的 AI（Claude Cod
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `python D:/github/agora/agora.py new "主題"`）：
    ```powershell
-   python D:/github/agora/agora.py assign <thread> --from antigravity --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from antigravity --to <AI> --file <交接單路徑>
    ```
-4. 你無法自己排程喚醒，所以要告訴 Richard：交接給 Claude、討論串路徑、你的額度幾點重置，請他屆時叫你依本 skill 的 C 段收回。然後停止工作。
+   `--to` 用 ⚠️ 提醒裡指名的接手方（已依此專案的工作分配比例與額度挑好）；沒有提醒時可省略 `--to`，
+   Agora 會在啟用的 AI 中依分配比例挑選。
+4. 你無法自己排程喚醒，所以要告訴 Richard：交接給誰、討論串路徑、你的額度幾點重置，請他屆時叫你依本 skill 的 C 段收回。然後停止工作。
 
 ## B. 所有 AI 都不足
 

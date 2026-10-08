@@ -78,6 +78,28 @@
         select(effortOptions, setting.effort || "", (v) => vscode.postMessage({ type: "set", party: p, field: "effort", value: v }), disabled));
     }
 
+    // 工作分配比例：只影響自動挑選接手方；0 表示只參與討論
+    let shareRow = null;
+    if (!disabled) {
+      const enabled = state.order.filter((x) => state.parties[x].enabled);
+      const total = enabled.reduce((sum, x) => sum + state.parties[x].share, 0);
+      const done = enabled.reduce((sum, x) => sum + (state.work[x] || 0), 0);
+      const mine = state.work[p] || 0;
+      const target = setting.share === 0 ? "不自動分派" : total ? `目標 ${Math.round(setting.share / total * 100)}%` : "";
+      const actual = `近 ${state.shareDays} 天 ${mine} 輪${done ? `（${Math.round(mine / done * 100)}%）` : ""}`;
+      const input = el("input", {
+        type: "number", min: "0", step: "1", value: String(setting.share), class: "share",
+        title: "自動挑選接手方時的工作分配比例；0 表示只參與討論、不自動分派給它",
+        onchange: (e) => {
+          const v = e.target.value.trim();
+          if (/^\d+$/.test(v)) vscode.postMessage({ type: "set", party: p, field: "share", value: v });
+          else e.target.value = String(setting.share);
+        },
+      });
+      shareRow = el("label", { class: "row" }, el("span", { class: "label" }, "分配比例"),
+        el("span", { class: "share-line" }, input, el("span", { class: "share-text" }, `${target} · ${actual}`)));
+    }
+
     const quota = state.quota ? state.quota[p] : null;
     return el("section", { class: `card${disabled ? " disabled" : ""}` },
       el("label", { class: "head" },
@@ -90,6 +112,7 @@
       quotaBar(quota, (state.quota && state.quota.threshold_pct) || 5),
       el("label", { class: "row" }, el("span", { class: "label" }, "模型"), modelSelect),
       effortRow,
+      shareRow,
       cat.error ? el("div", { class: "error" }, `⚠ ${cat.error}`) : null);
   }
 
@@ -120,7 +143,8 @@
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshQuota" }) }, "更新額度"),
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshModels" }) }, "更新模型清單")));
       children.push(el("p", { class: "muted small" },
-        "設定存在 .agora/config.json，對此專案的所有討論串生效；未參與的 AI 不會被呼叫，也不會成為接手方。"));
+        "設定存在 .agora/config.json，對此專案的所有討論串生效；未參與的 AI 不會被呼叫，也不會成為接手方。"
+        + "分配比例只影響自動挑選接手方（依近期接手輪數補足落後的一方），指定接手方時不受限制。"));
     }
     app.replaceChildren(...children);
   }

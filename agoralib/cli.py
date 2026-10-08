@@ -6,8 +6,11 @@ Agora：讓 Claude Code、Antigravity、Codex（與使用者）在同一個工�
 分派：assign 把工作交給某一方在背景執行；接手方每完成一小步就寫進度、檢查是否被叫停、
       檢查自己的額度；額度用完會等到重置後再繼續。recall 收回。
 
+討論與分派都在獨立的背景程序執行（見 jobs.py），呼叫者被終止（例如關掉 VSCode 視窗）時不受影響；
+呼叫者只負責顯示進度，中斷後可用 wait 重新接上。
+
 討論串存在 <工作區>/.agora/threads/<id>/：state.json（程式用）、transcript.md（給人看）、
-progress.md / control.json / worker.log（分派工作時）。
+job.json / job.log（討論的背景程序）、progress.md / control.json / worker.log（分派工作時）。
 """
 
 import argparse
@@ -22,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from agoralib import config, models, quota
+from agoralib import config, jobs, models, prune, quota, shares
 from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               NESTED_ENV, CallError, canonical)
 
@@ -214,6 +217,13 @@ def guard_nested():
         sys.exit("你是被 Agora 呼叫來的，回覆內容會自動轉給其他人，請直接回覆，不要再執行 agora.py 的討論或分派指令。")
 
 
+def remember_session(state: dict, party: str, session_id: Optional[str], external: bool = False):
+    """記下 Agora 在各 CLI 開過的對話，清理討論串時一併刪除（external：使用者帶進來的對話，不刪）"""
+    sessions = state.setdefault("sessions", [])
+    if session_id and not any(x["id"] == session_id for x in sessions):
+        sessions.append({"party": party, "id": session_id, "external": external})
+
+
 def new_party(model: Optional[str] = None, effort: Optional[str] = None) -> dict:
     return {"session_id": None, "seen": 0, "model": model, "effort": effort}
 
@@ -265,16 +275,19 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
     opts = call_opts(ws, state, party)
     model = "、".join(v for v in opts.values() if v)
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
+    jobs.set_current(party)
     before = git_status(ws.root)
     try:
         reply, session_id, meta = CALLERS[party](build_prompt(ws, state, party), info["session_id"], opts,
                                                  False, ws.root, TIMEOUT, thread)
     except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
+        remember_session(state, party, getattr(e, "session_id", None))
         save_state(thread, state)
         sys.exit(f"呼叫 {NAMES[party]} 失敗：{e}")
     after = git_status(ws.root)
     info["session_id"] = session_id
+    remember_session(state, party, session_id)
     add_message(thread, state, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x))
     info["seen"] = len(state["messages"])
     save_state(thread, state)
@@ -321,11 +334,37 @@ def targets_for(state: dict, sender: str, to: Optional[str], enabled=AI_PARTIES)
     return [target]
 
 
+def in_background(ws: Workspace, thread: Path, kind: str, argv: List[str], text: Optional[str] = None):
+    """在背景程序執行這個討論指令並把輸出轉到目前的終端；已在背景程序內則回傳，由呼叫者直接執行"""
+    if os.getenv(jobs.JOB_ENV):
+        return
+    job = jobs.active(thread)
+    if job:
+        sys.exit(f"此討論串已有進行中的討論（{NAMES.get(job.get('current'), '啟動中')}），"
+                 f"用 agora wait {thread.name} 查看，或 agora stop {thread.name} 停止。")
+    lock = thread / ".lock"
+    if lock.exists() and time.time() - lock.stat().st_mtime > 30 and not state_relay_active(thread):
+        lock.unlink(missing_ok=True)   # 上一個討論程序被強制結束時留下的鎖
+    if text is not None:
+        (thread / "job_input.md").write_text(text, encoding="utf-8")
+        argv = argv + ["--file", str(thread / "job_input.md")]
+    entry = AGORA_ROOT_DIR / "agora.py"
+    jobs.start(thread, kind, [sys.executable, str(entry), "--workspace", str(ws.root)] + argv, ws.root)
+    sys.exit(jobs.follow(thread))
+
+
+def state_relay_active(thread: Path) -> bool:
+    relay = load_state(thread).get("relay") or {}
+    return relay.get("status") in ("starting", "running", "waiting") and pid_alive(relay.get("pid"))
+
+
 def cmd_send(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     sender = canonical(args.sender)
     text = read_message(args)
+    in_background(ws, thread, "send", ["send", thread.name, "--from", sender] + (["--to", args.to] if args.to else []),
+                  text)
     with thread_lock(thread):
         state = load_state(thread)
         add_message(thread, state, sender, text)
@@ -343,6 +382,7 @@ def cmd_reply(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     party = require_enabled(ws, canonical(args.party))
+    in_background(ws, thread, "reply", ["reply", thread.name, "--party", party])
     with thread_lock(thread):
         print(invoke(ws, thread, load_state(thread), party))
 
@@ -350,9 +390,12 @@ def cmd_reply(ws: Workspace, args):
 def cmd_auto(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
+    in_background(ws, thread, "auto", ["auto", thread.name, "--rounds", str(args.rounds)]
+                  + (["--order", args.order] if args.order else []))
     with thread_lock(thread):
         state = load_state(thread)
-        order = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order             else thread_parties(state, ws.enabled())
+        order = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order \
+            else thread_parties(state, ws.enabled())
         if not order:
             sys.exit("此討論串沒有任何啟用中的 AI。")
         last = next((m["speaker"] for m in reversed(state["messages"]) if m["speaker"] in order), None)
@@ -393,27 +436,23 @@ def party_usage(party: str) -> Optional[dict]:
     return quota.usage(party)
 
 
-def pid_alive(pid: Optional[int]) -> bool:
-    if not pid:
-        return False
-    if sys.platform.startswith("win"):
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace").stdout
-        return str(pid) in out
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+pid_alive = jobs.pid_alive
 
 
-def pick_worker(owner: str, candidates: List[str]) -> str:
-    """沒指定接手方時，挑剩餘額度最多的另一方"""
-    others = [p for p in candidates if p != owner]
+def pick_worker(ws: Workspace, owner: str, candidates: List[str]) -> str:
+    """沒指定接手方時依分配比例挑選（見 shares.py）；大家額度都不足時挑額度最多的，等它重置後開始"""
+    weights = config.shares(ws.root)
+    others = [p for p in candidates if p != owner and weights[p] > 0]
     if not others:
-        sys.exit("沒有其他啟用中的 AI 可以接手。")
+        sys.exit("沒有可自動分派的 AI（其他啟用中 AI 的分配比例都是 0），請用 --to 指定接手方。")
     usages = {p: quota.usage(p) for p in others}
-    return max(others, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
+    work = shares.recent_work(ws.root)
+    worker = shares.pick(others, weights, work, usages) \
+        or max(others, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
+    total = sum(weights[p] for p in others)
+    print(f"依分配比例挑選 {NAMES[worker]}（" + "、".join(
+        f"{NAMES[p]} 目標 {int(weights[p] / total * 100 + 0.5)}% 近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪" for p in others) + "）")
+    return worker
 
 
 def cmd_assign(ws: Workspace, args):
@@ -421,7 +460,7 @@ def cmd_assign(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
-    worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(owner, ws.enabled())
+    worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
     if worker not in state["parties"]:
         state["parties"][worker] = new_party()
         save_state(thread, state)
@@ -441,19 +480,16 @@ def cmd_assign(ws: Workspace, args):
         state = load_state(thread)
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
-                          "session_id": args.session, "handoff": text.strip(), "started": now_str(),
+                          "session_id": args.session, "external_session": args.session,
+                          "handoff": text.strip(), "started": now_str(),
                           "updated": now_str()}
         save_state(thread, state)
 
-    flags = 0
-    if sys.platform.startswith("win"):
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    log = open(paths["log"], "a", encoding="utf-8")
-    entry = Path(__file__).resolve().parents[1] / "agora.py"
-    proc = subprocess.Popen([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
-                            cwd=ws.root, creationflags=flags, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
-    update_relay(thread, pid=proc.pid)
-    print(f"已分派給 {NAMES[worker]}（背景程序 PID {proc.pid}）。")
+    entry = AGORA_ROOT_DIR / "agora.py"
+    pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
+                     ws.root, paths["log"], paths["log"], append=True)
+    update_relay(thread, pid=pid)
+    print(f"已分派給 {NAMES[worker]}（背景程序 PID {pid}，關閉視窗也會繼續）。")
     print(f"進度：{paths['progress']}")
     print(f"查詢：python {entry.as_posix()} status {thread.name} --wait 900")
 
@@ -513,6 +549,11 @@ def cmd_work(ws: Workspace, args):
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
+            if getattr(e, "session_id", None):
+                with thread_lock(thread, wait=120):
+                    state = load_state(thread)
+                    remember_session(state, worker, e.session_id, e.session_id == relay.get("external_session"))
+                    save_state(thread, state)
             if exhausted or quota.low(party_usage(worker)):
                 quota.refresh(force=True)
                 continue
@@ -531,7 +572,9 @@ def cmd_work(ws: Workspace, args):
             state = load_state(thread)
             add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}")
             state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str())
+            remember_session(state, worker, session_id, session_id == relay.get("external_session"))
             save_state(thread, state)
+        shares.record(ws.root, worker, thread.name)
         if before != changed:
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
 
@@ -636,28 +679,167 @@ def cmd_quota(ws: Workspace, args):
 
 
 def cmd_parties(ws: Workspace, args):
-    """查看或修改此專案啟用的 AI 與模型"""
+    """查看或修改此專案啟用的 AI、模型與工作分配比例"""
     split = lambda v: [canonical(p) for p in v.split(",") if p.strip()] if v else []  # noqa: E731
     enable, disable = split(args.enable), split(args.disable)
     bad = [p for p in enable + disable if p not in AI_PARTIES]
     if bad:
         sys.exit(f"未知的 AI：{bad}，可用：{list(AI_PARTIES)}")
-    models_, efforts = parse_pairs(args.model), parse_pairs(args.effort)
-    if enable or disable or models_ or efforts:
+    models_, efforts, shares_ = parse_pairs(args.model), parse_pairs(args.effort), parse_pairs(args.share)
+    if enable or disable or models_ or efforts or shares_:
         guard_nested()
         try:
-            settings = config.update_parties(ws.root, enable, disable, models_, efforts)
+            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_)
         except ValueError as e:
             sys.exit(str(e))
     else:
         settings = config.party_settings(ws.root)
+    work = shares.recent_work(ws.root)
     if args.json:
-        print(json.dumps({"workspace": str(ws.root), "parties": settings}, ensure_ascii=False, indent=2))
+        print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
+                          "share_days": shares.SHARE_DAYS}, ensure_ascii=False, indent=2))
         return
+    total = sum(s["share"] for s in settings.values() if s["enabled"])
+    done = sum(work.get(p, 0) for p, s in settings.items() if s["enabled"])
     print(f"工作區：{ws.root}")
     for p, s in settings.items():
         detail = "、".join(v for v in (s["model"], s["effort"]) if v) or "CLI 預設"
-        print(f"  {'☑' if s['enabled'] else '☐'} {NAMES[p]:<12} {detail}")
+        line = f"  {'☑' if s['enabled'] else '☐'} {NAMES[p]:<12} {detail}"
+        if s["enabled"]:
+            target = f"{int(s['share'] / total * 100 + 0.5)}%" if total else "-"
+            actual = f"{int(work.get(p, 0) / done * 100 + 0.5)}%" if done else "-"
+            line += f"｜分配比例 {s['share']}（目標 {target}，近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪 {actual}）"
+        print(line)
+
+
+def cmd_wait(ws: Workspace, args):
+    """接上背景進行中的討論，顯示它的輸出直到結束"""
+    thread = ws.resolve_thread(args.thread)
+    if jobs.active(thread):
+        sys.exit(jobs.follow(thread))
+    job = jobs.read(thread)
+    if not job:
+        print("此討論串沒有背景討論紀錄。")
+        return
+    print(f"上一次的背景討論（{job.get('kind')}）已結束：{job.get('status')}（{job.get('finished') or job.get('updated')}）")
+    if args.output and (thread / "job.log").exists():
+        print((thread / "job.log").read_text(encoding="utf-8"))
+
+
+def cmd_stop(ws: Workspace, args):
+    """停止背景進行中的討論（已收到的回覆都已寫入逐字稿）"""
+    guard_nested()
+    thread = ws.resolve_thread(args.thread)
+    job = jobs.active(thread)
+    if not job:
+        print("此討論串沒有進行中的討論。分派的工作請用 recall。")
+        return
+    if job.get("pid"):
+        jobs.kill_tree(job["pid"])
+    jobs.update(thread, status="stopped", current=None, finished=now_str())
+    (thread / ".lock").unlink(missing_ok=True)
+    current = job.get("current")
+    add_system_note(thread, "⏹ 已停止背景討論" + (f"（當時在等 {NAMES[current]} 回覆）" if current else "") + "。")
+    print("已停止。")
+
+
+def activity(ws: Workspace) -> List[dict]:
+    """工作區內所有進行中的討論與分派"""
+    items = []
+    threads = sorted(p for p in ws.threads.glob("*") if (p / "state.json").exists()) if ws.threads.exists() else []
+    for thread in threads:
+        state = load_state(thread)
+        job = jobs.active(thread)
+        if job:
+            items.append({"thread": thread.name, "topic": state["topic"], "type": "discussion", "kind": job.get("kind"),
+                          "current": job.get("current"), "since": job.get("since"), "started": job.get("started"),
+                          "pid": job.get("pid")})
+        relay = state.get("relay") or {}
+        if relay.get("status") in ("starting", "running", "waiting"):
+            if pid_alive(relay.get("pid")):
+                items.append({"thread": thread.name, "topic": state["topic"], "type": "relay",
+                              "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),
+                              "waiting_until": relay.get("waiting_until"), "started": relay.get("started"),
+                              "pid": relay.get("pid")})
+            else:
+                update_relay(thread, status="interrupted")
+    return items
+
+
+def cmd_activity(ws: Workspace, args):
+    items = activity(ws)
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return
+    if not items:
+        print("目前沒有進行中的討論或分派。")
+    for it in items:
+        if it["type"] == "discussion":
+            who = f"等待 {NAMES[it['current']]} 回覆（{int((time.time() - it['since']) / 60)} 分鐘）" \
+                if it.get("current") and it.get("since") else "啟動中"
+            print(f"💬 {it['thread']}｜{it['topic']}｜{it['kind']}｜{who}")
+        else:
+            wait = f"，等到 {quota.fmt_time(it['waiting_until'])}" if it.get("waiting_until") else ""
+            print(f"🛠 {it['thread']}｜{it['topic']}｜{NAMES[it['worker']]} 接手 {it['status']}{wait}｜已跑 {it['rounds']} 輪")
+
+
+def cmd_keep(ws: Workspace, args):
+    """標記討論串為保留（prune 不會清理），--off 取消"""
+    thread = ws.resolve_thread(args.thread)
+    with thread_lock(thread):
+        state = load_state(thread)
+        state["keep"] = not args.off
+        save_state(thread, state)
+    print(f"{'已取消保留' if args.off else '已標記保留'}：{thread.name}（{state['topic']}）")
+
+
+def cmd_prune(ws: Workspace, args):
+    """清理不再需要的討論串（預設只列出，--yes 才刪除）；條件見 prune.py"""
+    if args.thread:
+        threads, days = [ws.resolve_thread(t) for t in args.thread], None
+    else:
+        threads = sorted(p for p in ws.threads.glob("*") if (p / "state.json").exists()) if ws.threads.exists() else []
+        days = args.days
+    candidates, kept = prune.scan(threads, days)
+    result = {"candidates": candidates, "kept": kept, "deleted": [], "errors": [], "dry_run": not args.yes}
+    if args.yes:
+        guard_nested()
+        for info in candidates:
+            out = prune.delete_thread(ws.threads / info["id"], info, not args.keep_sessions)
+            result["deleted"].append({**info, "removed": out["done"]})
+            result["errors"] += out["errors"]
+        prune.compact_work_log(ws.root, shares.SHARE_DAYS)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    def describe(info):
+        sessions = "、".join(sorted({NAMES[s["party"]] for s in info["sessions"]})) or "無"
+        return (f"{info['id']}｜{info['topic']}｜{info['messages']} 則｜閒置 {info['idle_days']:g} 天｜"
+                f"{info['bytes'] / 1024:.0f} KB｜AI 對話紀錄：{sessions}")
+    scope = "指定的討論串" if args.thread else f"超過 {args.days:g} 天沒有活動的討論串"
+    if not candidates:
+        print(f"沒有可清理的討論串（條件：{scope}、未標記保留、沒有未完成的分派、未在使用中）。")
+    elif args.yes:
+        print(f"已刪除 {len(candidates)} 個討論串：")
+        for info in result["deleted"]:
+            print(f"  • {describe(info)}")
+            for line in info["removed"]:
+                print(f"      - {line}")
+    else:
+        print(f"以下 {len(candidates)} 個討論串可以清理（{scope}）：")
+        for info in candidates:
+            print(f"  • {describe(info)}")
+        extra = "" if args.keep_sessions else "，並刪除 Agora 為它們在各 CLI 開的對話紀錄"
+        print(f"\n確認後加上 --yes 刪除{extra}。要留下某一串可先執行 agora keep <id>。")
+    for e in result["errors"]:
+        print(f"⚠️ {e}")
+    if kept and args.verbose:
+        print("\n保留：")
+        for info in kept:
+            print(f"  • {info['id']}｜{info['topic']}｜{info['reason']}")
+    elif kept:
+        print(f"（另有 {len(kept)} 個討論串保留，加 --verbose 查看原因）")
 
 
 def cmd_models(ws: Workspace, args):
@@ -841,6 +1023,8 @@ def main(argv=None):
     p.add_argument("--disable", help="停用的 AI，逗號分隔")
     p.add_argument("--model", action="append", help="例如 --model codex=gpt-6.1-sol；值為 default 表示改回 CLI 預設")
     p.add_argument("--effort", action="append", help="例如 --effort claude=high；值為 default 表示改回 CLI 預設")
+    p.add_argument("--share", action="append",
+                   help="自動分派的工作比例，例如 --share claude=5 --share codex=3；0 表示不自動分派給它，default 改回 1")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_parties)
 
@@ -848,6 +1032,33 @@ def main(argv=None):
     p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser("wait", help="接上背景進行中的討論，顯示輸出直到結束")
+    p.add_argument("thread")
+    p.add_argument("--output", action="store_true", help="討論已結束時，顯示它的完整輸出")
+    p.set_defaults(func=cmd_wait)
+
+    p = sub.add_parser("stop", help="停止背景進行中的討論")
+    p.add_argument("thread")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("activity", help="列出進行中的討論與分派")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_activity)
+
+    p = sub.add_parser("prune", help="清理不再需要的討論串（預設只列出，--yes 才刪除）")
+    p.add_argument("--days", type=float, default=30, help="超過幾天沒有活動才清理（預設 30）")
+    p.add_argument("--thread", action="append", help="只清理指定的討論串（不看天數，其餘條件照樣檢查）")
+    p.add_argument("--yes", action="store_true", help="確認刪除")
+    p.add_argument("--keep-sessions", action="store_true", help="只刪討論串，保留各 CLI 的對話紀錄")
+    p.add_argument("--verbose", action="store_true", help="列出保留的討論串與原因")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("keep", help="標記討論串為保留，prune 不會清理（--off 取消）")
+    p.add_argument("thread")
+    p.add_argument("--off", action="store_true")
+    p.set_defaults(func=cmd_keep)
 
     p = sub.add_parser("install", help="把 Agora 裝進工作區（啟用中 AI 的 skills、hooks、權限、.gitignore）")
     p.set_defaults(func=cmd_install)
@@ -867,4 +1078,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     ws = Workspace(resolve_workspace(args.workspace))
     os.environ.setdefault("AGORA_WORKSPACE", str(ws.root))
+    job_thread = os.getenv(jobs.JOB_ENV)
+    if job_thread and args.command in ("send", "reply", "auto"):
+        jobs.run(Path(job_thread), lambda: args.func(ws, args))
     args.func(ws, args)

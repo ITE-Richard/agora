@@ -103,11 +103,23 @@ async function runJson(args) {
 }
 
 /** 需要等 AI 回覆的動作：顯示可取消的進度通知 */
-function runLong(title, args, input) {
-  return vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Agora：${title}`, cancellable: true },
-    (progress, token) => runAgora(args, { input, token, onProgress: (m) => progress.report({ message: m }) }),
-  );
+const BACKGROUND_COMMANDS = ["send", "reply", "auto"];
+
+/** 討論在 agora.py 的背景程序執行：取消只是停止等待，討論會繼續，完成時另有通知 */
+async function runLong(title, args, input) {
+  const background = BACKGROUND_COMMANDS.includes(args[0]);
+  try {
+    return await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Agora：${title}`, cancellable: true },
+      (progress, token) => runAgora(args, { input, token, onProgress: (m) => progress.report({ message: m }) }),
+    );
+  } catch (e) {
+    if (background && e instanceof AgoraError && e.message === "已取消。") {
+      vscode.window.showInformationMessage("已停止等待，討論在背景繼續，完成時會通知。要停止討論，請在討論串上按右鍵選「停止討論」。");
+      return "";
+    }
+    throw e;
+  }
 }
 
 function showError(e) {
@@ -140,7 +152,8 @@ function loadThreads() {
 }
 
 class ThreadsProvider {
-  constructor() {
+  constructor(activity) {
+    this.activity = activity;
     this.emitter = new vscode.EventEmitter();
     this.onDidChangeTreeData = this.emitter.event;
   }
@@ -159,12 +172,17 @@ class ThreadsProvider {
     const messages = state.messages || [];
     const last = messages[messages.length - 1];
     const relay = state.relay;
-    const parts = [`${messages.length} 則`];
+    const job = this.activity.discussion(thread.id);
+    const parts = [];
+    if (job) parts.push(job.current ? `${NAMES[job.current]} 回覆中 ${minutesSince(job.since)}` : "討論啟動中");
+    parts.push(`${messages.length} 則`);
     if (relay) parts.push(`${NAMES[relay.worker]} ${RELAY_LABELS[relay.status] || relay.status}`);
+    if (state.keep) parts.push("保留");
     item.description = parts.join(" · ");
     const active = relay && ACTIVE_RELAY.includes(relay.status);
-    item.iconPath = new vscode.ThemeIcon(active ? "sync~spin" : relay ? "tasklist" : "comment-discussion");
-    item.contextValue = active ? "thread-relay-active" : relay ? "thread-relay" : "thread";
+    item.iconPath = new vscode.ThemeIcon(job || active ? "sync~spin" : relay ? "tasklist" : state.keep ? "pinned" : "comment-discussion");
+    item.contextValue = (active ? "thread-relay-active" : relay ? "thread-relay" : "thread") + (job ? "-job" : "")
+      + (state.keep ? "-kept" : "");
     const tip = new vscode.MarkdownString();
     tip.appendMarkdown(`**${state.topic}**\n\n`);
     tip.appendMarkdown(`參與者：${Object.keys(state.parties).map((p) => NAMES[p] || p).join("、")}\n\n`);
@@ -175,6 +193,68 @@ class ThreadsProvider {
     item.command = { command: "agora.openTranscript", title: "開啟逐字稿", arguments: [thread] };
     return item;
   }
+}
+
+function minutesSince(ts) {
+  if (!ts) return "";
+  const m = Math.floor((Date.now() / 1000 - ts) / 60);
+  return m < 1 ? "不到 1 分鐘" : `${m} 分鐘`;
+}
+
+/** 進行中的討論與分派（agora activity）；有東西結束時發出通知 */
+class Activity {
+  constructor() {
+    this.items = null;
+    this.emitter = new vscode.EventEmitter();
+    this.onDidChange = this.emitter.event;
+  }
+
+  discussion(threadId) {
+    return (this.items || []).find((x) => x.type === "discussion" && x.thread === threadId);
+  }
+
+  async load() {
+    let items;
+    try {
+      items = JSON.parse(await runAgora(["activity", "--json"], { log: false }));
+    } catch {
+      return;
+    }
+    const before = this.items;
+    this.items = items;
+    if (before) {
+      const key = (x) => `${x.type}:${x.thread}`;
+      const now = new Set(items.map(key));
+      for (const gone of before.filter((x) => !now.has(key(x)))) notifyFinished(gone);
+    }
+    this.emitter.fire();
+  }
+}
+
+function notifyFinished(item) {
+  const thread = loadThreads().find((t) => t.id === item.thread);
+  if (!thread) return;
+  let text;
+  let warn = false;
+  if (item.type === "discussion") {
+    let job = {};
+    try {
+      job = JSON.parse(fs.readFileSync(path.join(thread.dir, "job.json"), "utf8"));
+    } catch {}
+    if (job.status === "stopped") return;
+    warn = job.status !== "done";
+    text = warn ? `「${thread.state.topic}」的討論${job.status === "interrupted" ? "被中斷" : "失敗"}，詳見逐字稿。`
+      : `「${thread.state.topic}」的討論已完成。`;
+  } else {
+    const relay = thread.state.relay || {};
+    warn = relay.status !== "done";
+    text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}。`;
+  }
+  const shown = warn ? vscode.window.showWarningMessage(`Agora：${text}`, "開啟逐字稿")
+    : vscode.window.showInformationMessage(`Agora：${text}`, "開啟逐字稿");
+  shown.then((choice) => {
+    if (choice) openTranscript(thread);
+  });
 }
 
 async function pickThread(arg) {
@@ -224,6 +304,8 @@ async function askMessage(prompt) {
 class Model {
   constructor() {
     this.parties = null;   // agora parties --json
+    this.work = {};        // 近期各 AI 的接手輪數（同上）
+    this.shareDays = 7;
     this.catalog = null;   // agora models --json
     this.quota = null;     // agora quota --json
     this.errors = {};
@@ -242,12 +324,18 @@ class Model {
 
   async loadParties() {
     try {
-      this.parties = (await runJson(["parties", "--json"])).parties;
+      this.setParties(await runJson(["parties", "--json"]));
       delete this.errors.parties;
     } catch (e) {
       this.errors.parties = e.message;
     }
     this.emitter.fire();
+  }
+
+  setParties(data) {
+    this.parties = data.parties;
+    this.work = data.work || {};
+    this.shareDays = data.share_days || 7;
   }
 
   async loadCatalog(refresh = false) {
@@ -272,7 +360,7 @@ class Model {
 
   async update(args) {
     try {
-      this.parties = (await runJson(["parties", ...args, "--json"])).parties;
+      this.setParties(await runJson(["parties", ...args, "--json"]));
     } catch (e) {
       showError(e);
     }
@@ -285,6 +373,8 @@ class Model {
       agoraFound: !!agoraRoot(),
       installed: this.installed(),
       parties: this.parties,
+      work: this.work,
+      shareDays: this.shareDays,
       catalog: this.catalog,
       quota: this.quota,
       errors: this.errors,
@@ -382,7 +472,25 @@ function activate(context) {
   extensionPath = context.extensionPath;
   output = vscode.window.createOutputChannel("Agora");
   const model = new Model();
-  const threads = new ThreadsProvider();
+  const activity = new Activity();
+  const threads = new ThreadsProvider(activity);
+  activity.onDidChange(() => threads.refresh());
+
+  const activityBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 51);
+  activityBar.command = "workbench.view.extension.agora";
+  activity.onDidChange(() => {
+    const items = activity.items || [];
+    if (!items.length) {
+      activityBar.hide();
+      return;
+    }
+    activityBar.text = `$(sync~spin) Agora ${items.length} 進行中`;
+    activityBar.tooltip = "Agora 進行中（關閉視窗也會繼續）\n" + items.map((x) => x.type === "discussion"
+      ? `💬 ${x.topic}：${x.current ? `${NAMES[x.current]} 回覆中（${minutesSince(x.since)}）` : "啟動中"}`
+      : `🛠 ${x.topic}：${NAMES[x.worker]} 接手${RELAY_LABELS[x.status] || x.status}，已跑 ${x.rounds} 輪`).join("\n");
+    activityBar.show();
+  });
+  context.subscriptions.push(activityBar);
   const panel = new PartiesView(model);
 
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 50);
@@ -414,9 +522,10 @@ function activate(context) {
   const command = (id, fn) => context.subscriptions.push(
     vscode.commands.registerCommand(id, (...a) => Promise.resolve(fn(...a)).catch(showError)));
 
-  command("agora.refresh", () => {
+  command("agora.refresh", async () => {
     refreshAll();
     model.loadQuota();
+    await activity.load();
   });
 
   command("agora.install", async () => {
@@ -500,7 +609,7 @@ function activate(context) {
     const enabled = model.enabled();
     const worker = await vscode.window.showQuickPick(
       [
-        { label: "$(sparkle) 交給額度最多的 AI", to: null },
+        { label: "$(sparkle) 依分配比例自動挑選", description: "略過額度不足與比例為 0 的 AI", to: null },
         ...enabled.map((p) => ({
           label: NAMES[p], description: model.quota ? quotaText(model.quota[p]) : "", to: p,
         })),
@@ -512,7 +621,8 @@ function activate(context) {
     if (!text) return;
     const out = await runAgora(["assign", thread.id, "--from", "human", ...(worker.to ? ["--to", worker.to] : [])],
       { input: text });
-    vscode.window.showInformationMessage(out.trim().split("\n")[0]);
+    const lines = out.trim().split("\n").filter((l) => !l.startsWith("進度：") && !l.startsWith("查詢："));
+    vscode.window.showInformationMessage(lines.join(" "));
     threads.refresh();
   });
 
@@ -536,6 +646,84 @@ function activate(context) {
     if (!ok) return;
     vscode.window.showInformationMessage((await runAgora(["recall", thread.id])).trim());
     threads.refresh();
+  });
+
+  const fmtSize = (bytes) => (bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`);
+  const sessionNames = (info) => [...new Set(info.sessions.map((s) => NAMES[s.party]))].join("、") || "無";
+
+  command("agora.prune", async () => {
+    const days = await vscode.window.showInputBox({
+      prompt: "清理超過幾天沒有活動的討論串？（標記保留、分派工作未完成、使用中的一律不清）", value: "30",
+      validateInput: (v) => (/^\d+(\.\d+)?$/.test(v) ? undefined : "請輸入天數"),
+    });
+    if (!days) return;
+    const scan = JSON.parse(await runAgora(["prune", "--days", days, "--json"], { log: false }));
+    if (!scan.candidates.length) {
+      vscode.window.showInformationMessage(`沒有可清理的討論串（另有 ${scan.kept.length} 個保留）。`);
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      scan.candidates.map((c) => ({
+        label: c.topic, picked: true, info: c,
+        description: `閒置 ${c.idle_days} 天 · ${c.messages} 則 · ${fmtSize(c.bytes)}`,
+        detail: `${c.id} · AI 對話紀錄：${sessionNames(c)}`,
+      })),
+      { canPickMany: true, placeHolder: `勾選要刪除的討論串（另有 ${scan.kept.length} 個不符合條件、會保留）` },
+    );
+    if (!picked || !picked.length) return;
+    const ok = await vscode.window.showWarningMessage(
+      `刪除 ${picked.length} 個討論串，以及 Agora 為它們在各 AI CLI 開的對話紀錄？此動作無法復原。`,
+      { modal: true }, "刪除", "只刪討論串，保留對話紀錄");
+    if (!ok) return;
+    const args = ["prune", "--yes", ...picked.flatMap((x) => ["--thread", x.info.id])];
+    if (ok !== "刪除") args.push("--keep-sessions");
+    const result = JSON.parse(await runAgora([...args, "--json"]));
+    threads.refresh();
+    const msg = `已刪除 ${result.deleted.length} 個討論串。`;
+    if (result.errors.length) {
+      output.appendLine(result.errors.join("\n"));
+      vscode.window.showWarningMessage(`${msg}有 ${result.errors.length} 筆對話紀錄沒有刪除，詳見 Agora 輸出。`);
+    } else {
+      vscode.window.showInformationMessage(msg);
+    }
+  });
+
+  command("agora.deleteThread", async (arg) => {
+    const thread = await pickThread(arg);
+    if (!thread) return;
+    const scan = JSON.parse(await runAgora(["prune", "--thread", thread.id, "--json"], { log: false }));
+    if (!scan.candidates.length) {
+      vscode.window.showWarningMessage(`「${thread.state.topic}」不能刪除：${scan.kept[0].reason}。`);
+      return;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `刪除「${thread.state.topic}」？會一併刪除 Agora 為它在各 AI CLI 開的對話紀錄（${sessionNames(scan.candidates[0])}），無法復原。`,
+      { modal: true }, "刪除", "只刪討論串，保留對話紀錄");
+    if (!ok) return;
+    await runAgora(["prune", "--yes", "--thread", thread.id, ...(ok === "刪除" ? [] : ["--keep-sessions"])]);
+    threads.refresh();
+  });
+
+  command("agora.keep", async (arg) => {
+    const thread = await pickThread(arg);
+    if (thread) await runAgora(["keep", thread.id]);
+    threads.refresh();
+  });
+
+  command("agora.unkeep", async (arg) => {
+    const thread = await pickThread(arg);
+    if (thread) await runAgora(["keep", thread.id, "--off"]);
+    threads.refresh();
+  });
+
+  command("agora.stopJob", async (arg) => {
+    const thread = await pickThread(arg);
+    if (!thread) return;
+    const ok = await vscode.window.showWarningMessage(
+      `停止「${thread.state.topic}」進行中的討論？已收到的回覆都已寫入逐字稿。`, { modal: true }, "停止");
+    if (!ok) return;
+    vscode.window.showInformationMessage((await runAgora(["stop", thread.id])).trim());
+    activity.load();
   });
 
   command("agora.quota", async () => {
@@ -569,7 +757,8 @@ function activate(context) {
       clearTimeout(timer);
       timer = setTimeout(() => {
         threads.refresh();
-        if (uri.fsPath.endsWith("config.json")) model.loadParties();
+        model.loadParties();   // 設定變更，或分派進度改變了近期工作量
+        activity.load();
       }, 300);
     };
     watcher.onDidChange(onChange);
@@ -586,7 +775,12 @@ function activate(context) {
   if (ws && fs.existsSync(path.join(ws, ".agora"))) {
     model.loadParties();
     model.loadQuota();
+    activity.load();
   }
+  const activityTimer = setInterval(() => {
+    if (activity.items && activity.items.length) activity.load();   // 更新經過時間、偵測被強制結束的程序
+  }, 30 * 1000);
+  context.subscriptions.push({ dispose: () => clearInterval(activityTimer) });
   if (minutes > 0) {
     const interval = setInterval(() => model.loadQuota(), minutes * 60 * 1000);
     context.subscriptions.push({ dispose: () => clearInterval(interval) });

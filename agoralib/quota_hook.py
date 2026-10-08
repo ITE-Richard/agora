@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agoralib import config, quota  # noqa: E402
+from agoralib import config, quota, shares  # noqa: E402
 
 STATE_FILE = quota.AGORA_HOME / "hook_state.json"
 NAMES = quota.LABELS
@@ -28,8 +28,10 @@ def save_state(state: dict):
     quota._write_json(STATE_FILE, state)
 
 
-def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
-    """回傳 (提醒等級, 指示文字)；等級用來避免同一個重置週期內重複提醒"""
+def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None = None) -> tuple[str | None, str | None]:
+    """回傳 (提醒等級, 指示文字)；等級用來避免同一個重置週期內重複提醒。
+    weights / work 是工作分配比例與近期接手輪數（見 shares.py），沒給時視為比例相同，等於挑額度最多的一方。"""
+    weights, work = weights or {}, work or {}
     mine = usages.get(me)
     if not quota.low(mine):
         return None, None
@@ -38,10 +40,15 @@ def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
         return f"worker-{mine.get('resets_at')}", (
             f"⚠️ 你（{NAMES[me]}）的額度剩 {mine['remaining_pct']:.0f}%。完成目前這一小步後，"
             f"把交接說明寫進進度檔，回覆最後一行寫「【額度不足】」並結束。")
-    others = {p: u for p, u in usages.items() if p != me and u}
-    healthy = {p: u for p, u in others.items() if not quota.low(u)}
+    others = {p: u for p, u in usages.items() if p != me and u and weights.get(p, 1) > 0}
     my_reset = mine.get("resets_at")
-    if not healthy:
+    if not others:
+        return f"none-{my_reset}", (
+            f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
+            f"此專案沒有其他可接手的 AI（未啟用或分配比例為 0）。依 relay skill 把目前進度寫進 Agora 討論串，"
+            f"安排自己在重置後喚醒，然後停止工作。")
+    best = shares.pick(others, weights, work, others)
+    if not best:
         earliest = min(others.items(), key=lambda kv: kv[1].get("resets_at") or float("inf"), default=(None, {}))
         party, u = earliest
         hand_off = bool(party and u.get("resets_at") and my_reset and u["resets_at"] < my_reset)
@@ -50,17 +57,20 @@ def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
             + (f"{NAMES[party]} 最早重置（{quota.fmt_time(u['resets_at'])}），依 relay skill 仍交接給它；"
                f"接手程序會等它額度重置後才開始。" if hand_off else "依 relay skill 把目前進度寫進 Agora 討論串，不要交接。")
             + f"安排自己在 {quota.fmt_time(my_reset)} 重置後喚醒，然後停止工作。")
-    best = max(healthy, key=lambda p: healthy[p]["remaining_pct"])
     return f"self-{my_reset}", (
         f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
-        f"{NAMES[best]} 尚有 {healthy[best]['remaining_pct']:.0f}%。"
-        f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}，安排自己在重置後喚醒，然後停止工作。")
+        f"依工作分配比例由 {NAMES[best]} 接手（尚有 {others[best]['remaining_pct']:.0f}%）。"
+        f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}（assign --to {best}），安排自己在重置後喚醒，然後停止工作。")
+
+
+def project_root() -> Path | None:
+    start = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("AGORA_WORKSPACE") or os.getcwd()
+    return config.find_root(Path(start).resolve())
 
 
 def project_parties() -> list:
     """目前專案啟用的 AI：只在這些 AI 之間提醒交接（找不到專案設定時視為全部啟用）"""
-    start = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("AGORA_WORKSPACE") or os.getcwd()
-    root = config.find_root(Path(start).resolve())
+    root = project_root()
     return config.enabled(root) if root else list(quota.USAGE)
 
 
@@ -82,7 +92,8 @@ def main():
     if any(quota.is_stale(usages[p], max_age) for p in ("claude", "antigravity") if p in usages):
         quota.refresh_in_background()
 
-    level, text = advice(me, usages)
+    root = project_root()
+    level, text = advice(me, usages, config.shares(root) if root else None, shares.recent_work(root) if root else None)
     status = "【額度】" + "｜".join(quota.describe(NAMES[k], u) for k, u in usages.items())
 
     state = load_state()

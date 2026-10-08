@@ -19,6 +19,7 @@ python D:/github/agora/agora.py send $T --from antigravity --file 開場.md
 ```
 
 `send --from antigravity` 預設依序請其他所有 AI 回覆；`--to claude` 只請 Claude。
+討論在背景程序執行：等待被中斷（逾時、視窗關閉）時討論仍會繼續，之後用 `python D:/github/agora/agora.py wait <id>` 接上並取得回覆，`activity` 查看所有進行中的討論與分派。
 
 3. 查證回覆後再回應；出現「【已達成共識】」或只剩立場差異時停止。
 

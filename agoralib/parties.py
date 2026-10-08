@@ -44,6 +44,7 @@ class CallError(RuntimeError):
 
 def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int) -> Tuple[list, str]:
     env = {**os.environ, NESTED_ENV: "1"}
+    env.pop("AGORA_JOB", None)   # AI 執行的 agora 指令（quota、check）不是背景討論程序
     proc = subprocess.run(cmd, cwd=workspace, input=stdin_text if stdin_text is not None else "",
                           capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=timeout + 60, env=env)

@@ -4,14 +4,15 @@
 {
   "check": ["python", "-m", "unittest", "discover", "-s", "tests"],
   "parties": {
-    "claude":      {"enabled": true,  "model": "opus", "effort": "high"},
+    "claude":      {"enabled": true,  "model": "opus", "effort": "high", "share": 2},
     "antigravity": {"enabled": false},
-    "codex":       {"enabled": true,  "model": "gpt-6.1-sol"}
+    "codex":       {"enabled": true,  "model": "gpt-6.1-sol", "share": 1}
   }
 }
 
 parties 沒寫到的 AI 視為啟用、模型與推理強度沿用各 CLI 自己的預設。
 討論串可以另外指定模型（new --model），優先於這裡的設定。
+share 是自動挑選接手方時的工作分配比例（預設 1，0 表示不自動分派給它），見 shares.py。
 """
 
 import json
@@ -45,8 +46,10 @@ def party_settings(root: Path, data: Optional[dict] = None) -> Dict[str, dict]:
     out = {}
     for p in AI_PARTIES:
         item = raw.get(p) or {}
+        share = item.get("share", 1)
         out[p] = {"enabled": item.get("enabled", True) is not False,
-                  **{f: item.get(f) or None for f in FIELDS}}
+                  **{f: item.get(f) or None for f in FIELDS},
+                  "share": share if isinstance(share, int) and share >= 0 else 1}
     return out
 
 
@@ -54,9 +57,15 @@ def enabled(root: Path) -> List[str]:
     return [p for p, s in party_settings(root).items() if s["enabled"]]
 
 
+def shares(root: Path) -> Dict[str, int]:
+    return {p: s["share"] for p, s in party_settings(root).items()}
+
+
 def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str] = (),
-                   models: Optional[Dict[str, str]] = None, efforts: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
-    """更新參與方設定；模型或推理強度給空字串或 default 表示改回 CLI 預設。至少要保留一個 AI。"""
+                   models: Optional[Dict[str, str]] = None, efforts: Optional[Dict[str, str]] = None,
+                   shares: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
+    """更新參與方設定；模型或推理強度給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1。
+    至少要保留一個 AI。"""
     data = load(root)
     parties = data.setdefault("parties", {})
     for p, value in [(p, True) for p in enable] + [(p, False) for p in disable]:
@@ -68,6 +77,18 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
                 item[field] = value
             else:
                 item.pop(field, None)
+    for p, value in (shares or {}).items():
+        item = parties.setdefault(p, {})
+        if value in ("", "default"):
+            item.pop("share", None)
+            continue
+        try:
+            share = int(value)
+        except ValueError:
+            share = -1
+        if share < 0:
+            raise ValueError(f"分配比例必須是非負整數：{p}={value}")
+        item["share"] = share
     settings = party_settings(root, data)
     if not any(s["enabled"] for s in settings.values()):
         raise ValueError("至少要啟用一個 AI。")

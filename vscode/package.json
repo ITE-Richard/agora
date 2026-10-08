@@ -41,36 +41,204 @@
       ]
     },
     "commands": [
-      { "command": "agora.install", "title": "安裝到此專案", "category": "Agora" },
-      { "command": "agora.newThread", "title": "新增討論串", "category": "Agora", "icon": "$(add)" },
-      { "command": "agora.refresh", "title": "重新整理", "category": "Agora", "icon": "$(refresh)" },
-      { "command": "agora.openTranscript", "title": "開啟逐字稿", "category": "Agora", "icon": "$(open-preview)" },
-      { "command": "agora.send", "title": "發言", "category": "Agora", "icon": "$(comment)" },
-      { "command": "agora.auto", "title": "讓 AI 自動討論", "category": "Agora", "icon": "$(debug-continue)" },
-      { "command": "agora.assign", "title": "分派工作", "category": "Agora", "icon": "$(run)" },
-      { "command": "agora.status", "title": "查看分派進度", "category": "Agora" },
-      { "command": "agora.recall", "title": "收回分派的工作", "category": "Agora" },
-      { "command": "agora.quota", "title": "查看三方額度", "category": "Agora" },
-      { "command": "agora.check", "title": "執行工作區驗證", "category": "Agora" }
+      {
+        "command": "agora.install",
+        "title": "安裝到此專案",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.newThread",
+        "title": "新增討論串",
+        "category": "Agora",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agora.refresh",
+        "title": "重新整理",
+        "category": "Agora",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agora.openTranscript",
+        "title": "開啟逐字稿",
+        "category": "Agora",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "agora.send",
+        "title": "發言",
+        "category": "Agora",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "agora.auto",
+        "title": "讓 AI 自動討論",
+        "category": "Agora",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "agora.assign",
+        "title": "分派工作",
+        "category": "Agora",
+        "icon": "$(run)"
+      },
+      {
+        "command": "agora.status",
+        "title": "查看分派進度",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.recall",
+        "title": "收回分派的工作",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.quota",
+        "title": "查看三方額度",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.check",
+        "title": "執行工作區驗證",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.prune",
+        "title": "清理不再需要的討論串",
+        "category": "Agora",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agora.deleteThread",
+        "title": "刪除此討論串",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.keep",
+        "title": "標記保留（不會被清理）",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.unkeep",
+        "title": "取消保留",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.stopJob",
+        "title": "停止討論",
+        "category": "Agora",
+        "icon": "$(debug-stop)"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "agora.newThread", "when": "view == agora.threads", "group": "navigation@1" },
-        { "command": "agora.refresh", "when": "view == agora.threads", "group": "navigation@2" }
+        {
+          "command": "agora.newThread",
+          "when": "view == agora.threads",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agora.refresh",
+          "when": "view == agora.threads",
+          "group": "navigation@2"
+        },
+        {
+          "command": "agora.prune",
+          "when": "view == agora.threads",
+          "group": "9_cleanup"
+        }
       ],
       "view/item/context": [
-        { "command": "agora.send", "when": "view == agora.threads && viewItem =~ /^thread/", "group": "inline@1" },
-        { "command": "agora.openTranscript", "when": "view == agora.threads && viewItem =~ /^thread/", "group": "inline@2" },
-        { "command": "agora.send", "when": "view == agora.threads && viewItem =~ /^thread/", "group": "1_talk@1" },
-        { "command": "agora.auto", "when": "view == agora.threads && viewItem =~ /^thread/", "group": "1_talk@2" },
-        { "command": "agora.assign", "when": "view == agora.threads && viewItem =~ /^thread/", "group": "2_work@1" },
-        { "command": "agora.status", "when": "view == agora.threads && viewItem =~ /relay/", "group": "2_work@2" },
-        { "command": "agora.recall", "when": "view == agora.threads && viewItem == thread-relay-active", "group": "2_work@3" }
+        {
+          "command": "agora.send",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "inline@1"
+        },
+        {
+          "command": "agora.openTranscript",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "inline@2"
+        },
+        {
+          "command": "agora.send",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "1_talk@1"
+        },
+        {
+          "command": "agora.auto",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "1_talk@2"
+        },
+        {
+          "command": "agora.assign",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "2_work@1"
+        },
+        {
+          "command": "agora.status",
+          "when": "view == agora.threads && viewItem =~ /relay/",
+          "group": "2_work@2"
+        },
+        {
+          "command": "agora.recall",
+          "when": "view == agora.threads && viewItem =~ /relay-active/",
+          "group": "2_work@3"
+        },
+        {
+          "command": "agora.keep",
+          "when": "view == agora.threads && viewItem =~ /^thread(?!.*kept)/",
+          "group": "9_cleanup@1"
+        },
+        {
+          "command": "agora.unkeep",
+          "when": "view == agora.threads && viewItem =~ /kept$/",
+          "group": "9_cleanup@1"
+        },
+        {
+          "command": "agora.deleteThread",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "9_cleanup@2"
+        },
+        {
+          "command": "agora.stopJob",
+          "when": "view == agora.threads && viewItem =~ /-job/",
+          "group": "inline@0"
+        },
+        {
+          "command": "agora.stopJob",
+          "when": "view == agora.threads && viewItem =~ /-job/",
+          "group": "1_talk@3"
+        }
       ],
       "commandPalette": [
-        { "command": "agora.openTranscript", "when": "false" },
-        { "command": "agora.status", "when": "false" },
-        { "command": "agora.recall", "when": "false" }
+        {
+          "command": "agora.openTranscript",
+          "when": "false"
+        },
+        {
+          "command": "agora.status",
+          "when": "false"
+        },
+        {
+          "command": "agora.recall",
+          "when": "false"
+        },
+        {
+          "command": "agora.deleteThread",
+          "when": "false"
+        },
+        {
+          "command": "agora.keep",
+          "when": "false"
+        },
+        {
+          "command": "agora.unkeep",
+          "when": "false"
+        },
+        {
+          "command": "agora.stopJob",
+          "when": "false"
+        }
       ]
     },
     "configuration": {
