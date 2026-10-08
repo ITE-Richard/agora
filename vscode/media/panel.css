@@ -1,0 +1,151 @@
+body {
+  padding: 4px 12px 12px;
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+}
+
+.card {
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.card.disabled > :not(.head) {
+  opacity: 0.45;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.name {
+  font-weight: 600;
+}
+
+.badge {
+  margin-left: auto;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 4.5em 1fr;
+  align-items: center;
+  gap: 6px;
+}
+
+.label {
+  color: var(--vscode-descriptionForeground);
+}
+
+select {
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px;
+  color: var(--vscode-dropdown-foreground);
+  background: var(--vscode-dropdown-background);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 2px;
+  font: inherit;
+}
+
+.quota {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+}
+
+.bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.2));
+  border: 1px solid var(--vscode-widget-border, transparent);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+}
+
+.fill.ok {
+  background: var(--vscode-charts-green, #3fb950);
+}
+
+.fill.mid {
+  background: var(--vscode-charts-yellow, #d29922);
+}
+
+.fill.low {
+  background: var(--vscode-charts-red, #f85149);
+}
+
+.quota-text {
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+button {
+  padding: 4px 10px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: none;
+  border-radius: 2px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+button.secondary {
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+}
+
+button.secondary:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  border-left: 3px solid var(--vscode-notificationsInfoIcon-foreground, var(--vscode-focusBorder));
+  background: var(--vscode-textBlockQuote-background);
+}
+
+.error {
+  color: var(--vscode-errorForeground);
+  font-size: 0.9em;
+  white-space: pre-wrap;
+}
+
+.muted {
+  color: var(--vscode-descriptionForeground);
+}
+
+.small {
+  font-size: 0.85em;
+}

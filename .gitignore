@@ -3,3 +3,5 @@ __pycache__/
 .agora/
 *.log
 .env
+vscode/*.vsix
+vscode/agora-root.json
