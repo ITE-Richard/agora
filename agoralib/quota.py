@@ -15,6 +15,7 @@ Claude Code、Antigravity、Codex 剩餘額度查詢
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -66,14 +67,17 @@ def _read_json(path: Path) -> dict | None:
 def find_claude() -> str:
     if os.getenv("CLAUDE_PATH"):
         return os.environ["CLAUDE_PATH"]
-    candidates = list((Path.home() / ".vscode" / "extensions").glob(
-        "anthropic.claude-code-*/resources/native-binary/claude.exe"))
+    target_name = "claude.exe" if sys.platform.startswith("win") else "claude"
+    ext_dir = Path.home() / ".vscode" / "extensions"
+    candidates = [p for p in ext_dir.glob("anthropic.claude-code-*/resources/native-binary/*") if p.name == target_name]
 
     def version(p: Path):
         m = re.search(r"claude-code-([\d.]+)", str(p))
         return tuple(int(x) for x in m.group(1).split(".")) if m else ()
 
-    return str(max(candidates, key=version)) if candidates else "claude"
+    if candidates:
+        return str(max(candidates, key=version))
+    return shutil.which("claude") or "claude"
 
 
 # ───────────────────────── Claude ─────────────────────────
@@ -145,14 +149,17 @@ CODEX_SNAPSHOT = AGORA_HOME / "codex_quota.json"
 def find_codex() -> str:
     if os.getenv("CODEX_PATH"):
         return os.environ["CODEX_PATH"]
-    candidates = list((Path.home() / ".vscode" / "extensions").glob(
-        "openai.chatgpt-*/bin/windows-x86_64/codex.exe"))
+    target_name = "codex.exe" if sys.platform.startswith("win") else "codex"
+    ext_dir = Path.home() / ".vscode" / "extensions"
+    candidates = [p for p in ext_dir.glob("openai.chatgpt-*/bin/*/codex*") if p.name == target_name]
 
     def version(p: Path):
         m = re.search(r"chatgpt-([\d.]+)", str(p))
         return tuple(int(x) for x in m.group(1).split(".") if x.isdigit()) if m else ()
 
-    return str(max(candidates, key=version)) if candidates else "codex"
+    if candidates:
+        return str(max(candidates, key=version))
+    return shutil.which("codex") or "codex"
 
 
 def _codex_limits_from_file(path: Path) -> dict | None:

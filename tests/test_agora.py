@@ -202,6 +202,19 @@ class TestShares(unittest.TestCase):
             self.assertEqual(shares.recent_work(root), {"codex": 2, "claude": 1})
             self.assertEqual(shares.recent_work(root, include_active=False), {"codex": 1, "claude": 1})
 
+    def test_recent_work_ignores_malformed_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad_lines = [
+                json.dumps({"time": time.time()}),                 # missing party
+                json.dumps({"time": time.time(), "party": None}),   # None party
+                "not json",
+                json.dumps({"time": time.time(), "party": "codex"}),
+            ]
+            shares.log_path(root).parent.mkdir(parents=True)
+            shares.log_path(root).write_text("\n".join(bad_lines) + "\n", encoding="utf-8")
+            self.assertEqual(shares.recent_work(root), {"codex": 1})
+
     def test_hook_hands_off_by_share_not_just_quota(self):
         usages = {"claude": self.ok(3), "antigravity": self.ok(90), "codex": self.ok(40)}
         _, text = quota_hook.advice("claude", usages, {"antigravity": 1, "codex": 3}, {"antigravity": 0, "codex": 1})
@@ -277,6 +290,32 @@ class TestPrune(unittest.TestCase):
             self.assertEqual(len(out["errors"]), 1)
             self.assertFalse(thread.exists())
 
+    def test_delete_antigravity_cleans_wal_and_shm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agy_home = Path(tmp)
+            conv = agy_home / "conversations"
+            conv.mkdir(parents=True)
+            db = conv / "sess-1.db"
+            wal = conv / "sess-1.db-wal"
+            shm = conv / "sess-1.db-shm"
+            for f in (db, wal, shm):
+                f.write_text("dummy", encoding="utf-8")
+            with patch.object(prune, "AGY_HOME", agy_home):
+                prune.delete_antigravity("sess-1")
+            self.assertFalse(db.exists())
+            self.assertFalse(wal.exists())
+            self.assertFalse(shm.exists())
+
+    def test_delete_thread_ignores_unknown_party(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = self.make(Path(tmp), "old")
+            info = prune.scan([thread], 30)[0][0]
+            info["sessions"] = [{"party": "unknown_party", "id": "u1"}, {"party": None, "id": "n1"}]
+            out = prune.delete_thread(thread, info, True)
+            self.assertEqual(out["done"], [])
+            self.assertEqual(out["errors"], [])
+            self.assertFalse(thread.exists())
+
     def test_remember_session(self):
         s = state_with(["codex"])
         cli.remember_session(s, "codex", "a")
@@ -332,6 +371,21 @@ class TestJobs(unittest.TestCase):
                 self.assertTrue(jobs.pid_alive(pid))
             finally:
                 jobs.kill_tree(pid)
+
+
+class TestCliResolvers(unittest.TestCase):
+    def test_find_codex_env_override(self):
+        with patch.dict(os.environ, {"CODEX_PATH": "/custom/codex"}):
+            self.assertEqual(quota.find_codex(), "/custom/codex")
+
+    def test_find_claude_env_override(self):
+        with patch.dict(os.environ, {"CLAUDE_PATH": "/custom/claude"}):
+            self.assertEqual(quota.find_claude(), "/custom/claude")
+
+    def test_find_agy_env_override(self):
+        from agoralib import parties
+        with patch.dict(os.environ, {"AGY_PATH": "/custom/agy"}):
+            self.assertEqual(parties.find_agy(), "/custom/agy")
 
 
 if __name__ == "__main__":

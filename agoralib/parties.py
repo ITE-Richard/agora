@@ -10,7 +10,9 @@
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -66,7 +68,13 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int) ->
 # ───────────────────────── Antigravity ─────────────────────────
 
 def find_agy() -> str:
-    return os.getenv("AGY_PATH", str(Path.home() / ".gemini" / "bin" / "agy.exe"))
+    if os.getenv("AGY_PATH"):
+        return os.environ["AGY_PATH"]
+    name = "agy.exe" if sys.platform.startswith("win") else "agy"
+    default = Path.home() / ".gemini" / "bin" / name
+    if default.exists():
+        return str(default)
+    return shutil.which("agy") or str(default)
 
 
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,

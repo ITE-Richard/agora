@@ -40,8 +40,9 @@ def recent_work(root: Path, days: float = SHARE_DAYS, include_active: bool = Tru
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if entry.get("time", 0) >= since:
-                work[entry["party"]] = work.get(entry["party"], 0) + 1
+            party = entry.get("party")
+            if party and entry.get("time", 0) >= since:
+                work[party] = work.get(party, 0) + 1
     except OSError:
         pass
     if include_active:

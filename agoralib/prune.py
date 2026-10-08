@@ -110,8 +110,15 @@ def delete_antigravity(session_id: str) -> str:
     except PermissionError:
         raise RuntimeError("對話正在使用中")
     removed = 0
-    for path in [AGY_HOME / "conversations" / f"{session_id}.db", AGY_HOME / "brain" / session_id,
-                 AGY_HOME / "annotations" / f"{session_id}.pbtxt"]:
+    conv_dir = AGY_HOME / "conversations"
+    if conv_dir.exists():
+        for p in conv_dir.glob(f"{session_id}.db*"):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    for path in [AGY_HOME / "brain" / session_id, AGY_HOME / "annotations" / f"{session_id}.pbtxt"]:
         if path.exists():
             shutil.rmtree(path) if path.is_dir() else path.unlink()
             removed += 1
@@ -129,10 +136,17 @@ def delete_thread(thread: Path, info: dict, with_sessions: bool) -> Dict[str, li
     done, errors = [], []
     if with_sessions:
         for s in info["sessions"]:
+            party = s.get("party")
+            sid = s.get("id")
+            if not party or not sid:
+                continue
+            deleter = DELETERS.get(party)
+            if not deleter:
+                continue
             try:
-                done.append(f"{s['party']} {s['id']}：{DELETERS[s['party']](s['id'])}")
+                done.append(f"{party} {sid}：{deleter(sid)}")
             except Exception as e:
-                errors.append(f"{s['party']} {s['id']}：{e}")
+                errors.append(f"{party} {sid}：{e}")
     shutil.rmtree(thread)
     return {"done": done, "errors": errors}
 
@@ -146,7 +160,8 @@ def compact_work_log(root: Path, keep_days: float):
     lines = []
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            if json.loads(line).get("time", 0) >= since:
+            entry = json.loads(line)
+            if entry.get("time", 0) >= since and entry.get("party"):
                 lines.append(line)
         except json.JSONDecodeError:
             continue
