@@ -620,7 +620,7 @@ def cmd_recall(ws: Workspace, args):
 
 # ───────────────────────── 其他 ─────────────────────────
 
-DEFAULT_CHECK = ["python", "-m", "unittest", "discover", "-s", "tests"]
+DEFAULT_CHECK = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
 
 
 def cmd_check(ws: Workspace, args):

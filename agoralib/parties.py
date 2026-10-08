@@ -79,26 +79,34 @@ def find_agy() -> str:
 
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path) -> Tuple[str, str, str]:
-    if len(prompt) > 20000:  # Windows 命令列上限約 32k；agy 只能從參數收訊息
-        overflow = scratch / f"long_message_{os.getpid()}.md"
-        overflow.write_text(prompt, encoding="utf-8")
-        prompt = f"這則訊息較長，完整內容在 {overflow}，請先讀取該檔再照內容回覆。"
-    cmd = [find_agy(), "-p", prompt, "--output-format", "json", "--print-timeout", f"{timeout}s"]
-    if session_id:
-        cmd += ["--conversation", session_id]
-    if opts.get("model"):
-        cmd += ["--model", opts["model"]]
-    if opts.get("effort"):
-        cmd += ["--effort", opts["effort"]]
-    events, stderr = _run(cmd, workspace, None, timeout)
-    result = events[-1]
-    reply = (result.get("response") or "").strip()
-    if result.get("status") != "SUCCESS" or not reply:
-        detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-        raise CallError(f"Antigravity 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)),
-                        denied=bool(result.get("denied_actions")), session_id=result.get("conversation_id"))
-    meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
-    return reply, result.get("conversation_id") or session_id, meta
+    overflow = None
+    try:
+        if len(prompt) > 20000:  # Windows 命令列上限約 32k；agy 只能從參數收訊息
+            overflow = scratch / f"long_message_{os.getpid()}.md"
+            overflow.write_text(prompt, encoding="utf-8")
+            prompt = f"這則訊息較長，完整內容在 {overflow}，請先讀取該檔再照內容回覆。"
+        cmd = [find_agy(), "-p", prompt, "--output-format", "json", "--print-timeout", f"{timeout}s"]
+        if session_id:
+            cmd += ["--conversation", session_id]
+        if opts.get("model"):
+            cmd += ["--model", opts["model"]]
+        if opts.get("effort"):
+            cmd += ["--effort", opts["effort"]]
+        events, stderr = _run(cmd, workspace, None, timeout)
+        result = events[-1]
+        reply = (result.get("response") or "").strip()
+        if result.get("status") != "SUCCESS" or not reply:
+            detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
+            raise CallError(f"Antigravity 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)),
+                            denied=bool(result.get("denied_actions")), session_id=result.get("conversation_id"))
+        meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
+        return reply, result.get("conversation_id") or session_id, meta
+    finally:
+        if overflow:
+            try:
+                overflow.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ───────────────────────── Claude Code ─────────────────────────

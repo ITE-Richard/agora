@@ -364,12 +364,15 @@ def refresh_in_background():
     """丟到背景執行 refresh，不阻塞呼叫者（hook 用）"""
     if REFRESH_LOCK.exists() and time.time() - REFRESH_LOCK.stat().st_mtime < 120:
         return
-    flags = 0
+    kwargs = {}
     if sys.platform.startswith("win"):
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
     subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh", "--quiet"],
-                     cwd=AGORA_HOME, creationflags=flags, close_fds=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                     cwd=AGORA_HOME, close_fds=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs)
 
 
 def fmt_time(ts) -> str:

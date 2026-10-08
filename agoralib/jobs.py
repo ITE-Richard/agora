@@ -62,10 +62,11 @@ def spawn(argv: list, cwd: Path, stdout: Path, stderr: Path, append: bool = Fals
     pid_file = stdout.with_name(f".spawn-{os.getpid()}-{time.time_ns()}.pid")
     spec = {"argv": argv, "cwd": str(cwd), "stdout": str(stdout), "stderr": str(stderr), "append": append,
             "env": env or {}, "pid_file": str(pid_file)}
+    extra = {"creationflags": FLAGS} if sys.platform.startswith("win") else {}
     subprocess.run([sys.executable, str(Path(__file__).resolve()), "launch", json.dumps(spec)],
-                   creationflags=FLAGS, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=60, check=True)
-    pid = int(pid_file.read_text())
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=60, check=True, **extra)
+    pid = int(pid_file.read_text(encoding="utf-8"))
     pid_file.unlink(missing_ok=True)
     return pid
 
@@ -83,7 +84,7 @@ def _launch(spec: dict):
             proc = subprocess.Popen(spec["argv"], creationflags=FLAGS | BREAKAWAY, **kwargs)
         except OSError:   # 所在的 job 不允許脫離
             proc = subprocess.Popen(spec["argv"], creationflags=FLAGS, **kwargs)
-    Path(spec["pid_file"]).write_text(str(proc.pid))
+    Path(spec["pid_file"]).write_text(str(proc.pid), encoding="utf-8")
 
 
 # ───────────────────────── 討論工作 ─────────────────────────
