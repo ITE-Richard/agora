@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from agoralib import quota
+from agoralib import config, models, quota
 from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               NESTED_ENV, CallError, canonical)
 
@@ -101,10 +101,10 @@ class Workspace:
         self.threads = self.home / "threads"
 
     def config(self) -> dict:
-        try:
-            return json.loads((self.home / "config.json").read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        return config.load(self.root)
+
+    def enabled(self) -> List[str]:
+        return config.enabled(self.root)
 
     def resolve_thread(self, ref: str) -> Path:
         threads = sorted(p for p in self.threads.glob("*") if (p / "state.json").exists()) \
@@ -195,13 +195,49 @@ def read_message(args) -> str:
     return text
 
 
+def parse_pairs(items: Optional[List[str]]) -> dict:
+    """["codex=gpt-5", "claude=opus"] → {"codex": "gpt-5", "claude": "opus"}"""
+    out = {}
+    for item in items or []:
+        if "=" not in item:
+            sys.exit(f"格式應為 <AI>=<值>：{item}")
+        party, value = item.split("=", 1)
+        party = canonical(party)
+        if party not in AI_PARTIES:
+            sys.exit(f"未知的 AI：{party}，可用：{list(AI_PARTIES)}")
+        out[party] = value.strip()
+    return out
+
+
 def guard_nested():
     if os.getenv(NESTED_ENV):
         sys.exit("你是被 Agora 呼叫來的，回覆內容會自動轉給其他人，請直接回覆，不要再執行 agora.py 的討論或分派指令。")
 
 
-def thread_parties(state: dict) -> List[str]:
-    return list(state["parties"])
+def new_party(model: Optional[str] = None, effort: Optional[str] = None) -> dict:
+    return {"session_id": None, "seen": 0, "model": model, "effort": effort}
+
+
+def thread_parties(state: dict, enabled=AI_PARTIES) -> List[str]:
+    """討論串中目前仍在專案啟用名單內的 AI"""
+    return [p for p in state["parties"] if p in enabled]
+
+
+def require_enabled(ws: Workspace, party: str) -> str:
+    enabled = ws.enabled()
+    if party not in AI_PARTIES:
+        sys.exit(f"未知的 AI：{party}，可用：{list(AI_PARTIES)}")
+    if party not in enabled:
+        sys.exit(f"{NAMES[party]} 未在此專案啟用（目前啟用：{', '.join(enabled)}；"
+                 f"可用 agora parties --enable {party} 加入）。")
+    return party
+
+
+def call_opts(ws: Workspace, state: dict, party: str) -> dict:
+    """模型與推理強度：討論串自己指定的優先，其次是專案設定，都沒有就用 CLI 預設"""
+    info = state["parties"].get(party) or {}
+    settings = config.party_settings(ws.root)[party]
+    return {f: info.get(f) or settings.get(f) for f in config.FIELDS}
 
 
 # ───────────────────────── 討論 ─────────────────────────
@@ -212,7 +248,7 @@ def build_prompt(ws: Workspace, state: dict, party: str) -> str:
               if not (m["speaker"] == party and m["via_cli"])]
     parts = []
     if not info["session_id"]:
-        others = "、".join(NAMES[p] for p in thread_parties(state) if p != party)
+        others = "、".join(NAMES[p] for p in thread_parties(state, ws.enabled()) if p != party)
         parts.append(PREAMBLE.format(me=NAMES[party], others=others, human=NAMES[HUMAN], workspace=ws.root,
                                      topic=state["topic"]))
         if unseen:
@@ -225,11 +261,13 @@ def build_prompt(ws: Workspace, state: dict, party: str) -> str:
 
 def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
     """請 party 讀取未讀訊息並回覆（呼叫者需持有 thread_lock）"""
-    info = state["parties"][party]
-    print(f"…等待 {NAMES[party]} 回覆", file=sys.stderr, flush=True)
+    info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
+    opts = call_opts(ws, state, party)
+    model = "、".join(v for v in opts.values() if v)
+    print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
     before = git_status(ws.root)
     try:
-        reply, session_id, meta = CALLERS[party](build_prompt(ws, state, party), info["session_id"], info,
+        reply, session_id, meta = CALLERS[party](build_prompt(ws, state, party), info["session_id"], opts,
                                                  False, ws.root, TIMEOUT, thread)
     except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
@@ -237,7 +275,7 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
         sys.exit(f"呼叫 {NAMES[party]} 失敗：{e}")
     after = git_status(ws.root)
     info["session_id"] = session_id
-    add_message(thread, state, party, reply, via_cli=True, meta=meta)
+    add_message(thread, state, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x))
     info["seen"] = len(state["messages"])
     save_state(thread, state)
     if before != after:
@@ -249,18 +287,15 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
 
 def cmd_new(ws: Workspace, args):
     guard_nested()
-    parties = [canonical(p) for p in (args.parties.split(",") if args.parties else AI_PARTIES)]
-    bad = [p for p in parties if p not in AI_PARTIES]
-    if bad:
-        sys.exit(f"未知的參與方：{bad}，可用：{list(AI_PARTIES)}")
+    parties = [require_enabled(ws, canonical(p)) for p in args.parties.split(",")] if args.parties else ws.enabled()
     ws.threads.mkdir(parents=True, exist_ok=True)
     thread = ws.threads / f"{datetime.now():%Y%m%d-%H%M%S}-{slugify(args.topic)}"
     thread.mkdir()
-    models = dict(m.split("=", 1) for m in (args.model or []))
+    models, efforts = parse_pairs(args.model), parse_pairs(args.effort)
     state = {
         "topic": args.topic,
         "created": now_str(),
-        "parties": {p: {"session_id": None, "seen": 0, "model": models.get(p)} for p in parties},
+        "parties": {p: new_party(models.get(p), efforts.get(p)) for p in parties},
         "messages": [],
     }
     save_state(thread, state)
@@ -270,8 +305,8 @@ def cmd_new(ws: Workspace, args):
     print(thread.name)
 
 
-def targets_for(state: dict, sender: str, to: Optional[str]) -> List[str]:
-    parties = thread_parties(state)
+def targets_for(state: dict, sender: str, to: Optional[str], enabled=AI_PARTIES) -> List[str]:
+    parties = thread_parties(state, enabled)
     if to == "none":
         return []
     if to == "all" or (to is None and sender != HUMAN):
@@ -279,8 +314,8 @@ def targets_for(state: dict, sender: str, to: Optional[str]) -> List[str]:
     if to is None:
         return []
     target = canonical(to)
-    if target not in parties:
-        sys.exit(f"{to} 不在此討論串的參與者中：{parties}")
+    if target not in enabled:
+        sys.exit(f"{to} 未在此專案啟用：{list(enabled)}")
     if target == sender:
         sys.exit("不能請自己回覆。")
     return [target]
@@ -295,7 +330,7 @@ def cmd_send(ws: Workspace, args):
         state = load_state(thread)
         add_message(thread, state, sender, text)
         save_state(thread, state)
-        targets = targets_for(state, sender, args.to)
+        targets = targets_for(state, sender, args.to, ws.enabled())
         if not targets:
             print("已記錄，尚未請任何一方回覆。")
             return
@@ -307,8 +342,9 @@ def cmd_send(ws: Workspace, args):
 def cmd_reply(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
+    party = require_enabled(ws, canonical(args.party))
     with thread_lock(thread):
-        print(invoke(ws, thread, load_state(thread), canonical(args.party)))
+        print(invoke(ws, thread, load_state(thread), party))
 
 
 def cmd_auto(ws: Workspace, args):
@@ -316,7 +352,9 @@ def cmd_auto(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     with thread_lock(thread):
         state = load_state(thread)
-        order = [canonical(p) for p in args.order.split(",")] if args.order else thread_parties(state)
+        order = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order             else thread_parties(state, ws.enabled())
+        if not order:
+            sys.exit("此討論串沒有任何啟用中的 AI。")
         last = next((m["speaker"] for m in reversed(state["messages"]) if m["speaker"] in order), None)
         idx = (order.index(last) + 1) % len(order) if last in order else 0
         for i in range(args.rounds):
@@ -372,6 +410,8 @@ def pid_alive(pid: Optional[int]) -> bool:
 def pick_worker(owner: str, candidates: List[str]) -> str:
     """沒指定接手方時，挑剩餘額度最多的另一方"""
     others = [p for p in candidates if p != owner]
+    if not others:
+        sys.exit("沒有其他啟用中的 AI 可以接手。")
     usages = {p: quota.usage(p) for p in others}
     return max(others, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
 
@@ -381,11 +421,9 @@ def cmd_assign(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
-    worker = canonical(args.to) if args.to else pick_worker(owner, thread_parties(state))
-    if worker not in AI_PARTIES:
-        sys.exit(f"接手方必須是 AI：{list(AI_PARTIES)}")
+    worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(owner, ws.enabled())
     if worker not in state["parties"]:
-        state["parties"][worker] = {"session_id": None, "seen": 0, "model": None}
+        state["parties"][worker] = new_party()
         save_state(thread, state)
     text = read_message(args)
     old = state.get("relay") or {}
@@ -469,7 +507,7 @@ def cmd_work(ws: Workspace, args):
         before = git_status(ws.root)
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         try:
-            reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), state["parties"][worker],
+            reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), call_opts(ws, state, worker),
                                                       True, ws.root, WORK_TIMEOUT, thread)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             exhausted = isinstance(e, CallError) and e.quota_exhausted
@@ -594,7 +632,50 @@ def cmd_show(ws: Workspace, args):
 
 
 def cmd_quota(ws: Workspace, args):
-    quota.main(args.rest)
+    quota.main([f for f, on in (("--refresh", args.refresh), ("--json", args.json)) if on])
+
+
+def cmd_parties(ws: Workspace, args):
+    """查看或修改此專案啟用的 AI 與模型"""
+    split = lambda v: [canonical(p) for p in v.split(",") if p.strip()] if v else []  # noqa: E731
+    enable, disable = split(args.enable), split(args.disable)
+    bad = [p for p in enable + disable if p not in AI_PARTIES]
+    if bad:
+        sys.exit(f"未知的 AI：{bad}，可用：{list(AI_PARTIES)}")
+    models_, efforts = parse_pairs(args.model), parse_pairs(args.effort)
+    if enable or disable or models_ or efforts:
+        guard_nested()
+        try:
+            settings = config.update_parties(ws.root, enable, disable, models_, efforts)
+        except ValueError as e:
+            sys.exit(str(e))
+    else:
+        settings = config.party_settings(ws.root)
+    if args.json:
+        print(json.dumps({"workspace": str(ws.root), "parties": settings}, ensure_ascii=False, indent=2))
+        return
+    print(f"工作區：{ws.root}")
+    for p, s in settings.items():
+        detail = "、".join(v for v in (s["model"], s["effort"]) if v) or "CLI 預設"
+        print(f"  {'☑' if s['enabled'] else '☐'} {NAMES[p]:<12} {detail}")
+
+
+def cmd_models(ws: Workspace, args):
+    """各 AI 可選的模型與推理強度"""
+    data = models.catalog(refresh=args.refresh)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    for p in AI_PARTIES:
+        c = data.get(p) or {}
+        default = "、".join(v for v in (c.get("default") or {}).values() if v) or "未知"
+        print(f"{NAMES[p]}（預設：{default}）")
+        for m in c.get("models", []):
+            print(f"  {m['id']:<28} {m['label']}")
+        if c.get("efforts"):
+            print(f"  推理強度：{' / '.join(c['efforts'])}")
+        if c.get("error"):
+            print(f"  ⚠️ {c['error']}")
 
 
 def _merge_json(path: Path, update) -> dict:
@@ -611,13 +692,21 @@ def _merge_json(path: Path, update) -> dict:
 
 
 def cmd_install(ws: Workspace, args):
-    """把 Agora 裝進工作區：三方使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設驗證設定"""
+    """把 Agora 裝進工作區：啟用中各 AI 的使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設設定"""
     import shutil
     root = AGORA_ROOT_DIR
     hook = f"python {(root / 'agoralib' / 'quota_hook.py').as_posix()}"
     done = []
 
+    config_file = config.config_path(ws.root)
+    if not config_file.exists():
+        config.save(ws.root, {"check": DEFAULT_CHECK, "parties": {p: {"enabled": True} for p in AI_PARTIES}})
+        done.append(f"預設設定 → {config_file}（用 agora parties 或 VSCode 擴充套件選擇參與的 AI）")
+    enabled = ws.enabled()
+
     for agent, dest in (("claude", ws.root / ".claude" / "skills"), ("antigravity", ws.root / ".agents" / "skills")):
+        if agent not in enabled:
+            continue
         for skill in ("agora", "relay"):
             target = dest / skill
             target.mkdir(parents=True, exist_ok=True)
@@ -625,13 +714,14 @@ def cmd_install(ws: Workspace, args):
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
-    agents_md = ws.root / "AGENTS.md"
-    section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
-    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-    text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
-        if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
-    agents_md.write_text(text.rstrip() + "\n", encoding="utf-8")
-    done.append(f"Codex 說明 → {agents_md}")
+    if "codex" in enabled:
+        agents_md = ws.root / "AGENTS.md"
+        section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
+        text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+        text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
+            if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
+        agents_md.write_text(text.rstrip() + "\n", encoding="utf-8")
+        done.append(f"Codex 說明 → {agents_md}")
 
     def claude_hooks(data):
         hooks = data.setdefault("hooks", {})
@@ -641,13 +731,12 @@ def cmd_install(ws: Workspace, args):
             if matcher:
                 group["matcher"] = matcher
             hooks[event] = groups + [group]
-    _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks)
-    done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
+    if "claude" in enabled:
+        _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks)
+        done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
 
     def agy_hooks(data):
         data["agora-quota"] = {"PreInvocation": [{"type": "command", "command": f"{hook} agy-pre", "timeout": 15}]}
-    _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
-    done.append("Antigravity hook → .agents/hooks.json")
 
     # Antigravity CLI 的權限是全域、完整比對：只開放接手方需要的固定指令與此工作區的寫入
     def agy_permissions(data):
@@ -657,8 +746,11 @@ def cmd_install(ws: Workspace, args):
                      f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:
                 allow.append(rule)
-    _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
-    done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
+    if "antigravity" in enabled:
+        _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
+        done.append("Antigravity hook → .agents/hooks.json")
+        _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
+        done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
     gitignore = ws.root / ".gitignore"
     lines = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
@@ -668,16 +760,11 @@ def cmd_install(ws: Workspace, args):
     gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
     done.append(".gitignore 加入 .agora/、.claude/settings.local.json")
 
-    config = ws.home / "config.json"
-    if not config.exists():
-        ws.home.mkdir(parents=True, exist_ok=True)
-        config.write_text(json.dumps({"check": DEFAULT_CHECK}, indent=2) + "\n", encoding="utf-8")
-        done.append(f"預設驗證設定 → {config}")
-
-    print(f"已將 Agora 安裝到 {ws.root}：")
+    print(f"已將 Agora 安裝到 {ws.root}（參與的 AI：{'、'.join(NAMES[p] for p in enabled)}）：")
     for d in done:
         print(f"  • {d}")
-    print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+    if "claude" in enabled:
+        print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
 
 
 def add_message_args(p):
@@ -699,8 +786,9 @@ def main(argv=None):
 
     p = sub.add_parser("new", help="建立討論串，輸出 ID")
     p.add_argument("topic")
-    p.add_argument("--parties", help="參與的 AI，逗號分隔（預設全部：claude,antigravity,codex）")
-    p.add_argument("--model", action="append", help="指定模型，例如 --model claude=sonnet --model codex=gpt-5")
+    p.add_argument("--parties", help="參與的 AI，逗號分隔（預設：此專案啟用的全部 AI）")
+    p.add_argument("--model", action="append", help="此討論串的模型，例如 --model claude=sonnet（預設依專案設定）")
+    p.add_argument("--effort", action="append", help="此討論串的推理強度，例如 --effort codex=high")
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("send", help="發言；AI 發言預設請其他所有 AI 依序回覆，人類發言預設只記錄")
@@ -743,11 +831,25 @@ def main(argv=None):
     p = sub.add_parser("check", help="工作區驗證（語法檢查＋.agora/config.json 的 check 指令）")
     p.set_defaults(func=cmd_check)
 
-    p = sub.add_parser("quota", help="三方剩餘額度（--refresh、--json）")
-    p.add_argument("rest", nargs=argparse.REMAINDER)
+    p = sub.add_parser("quota", help="三方剩餘額度")
+    p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_quota)
 
-    p = sub.add_parser("install", help="把 Agora 裝進工作區（skills、hooks、權限、.gitignore）")
+    p = sub.add_parser("parties", help="查看或修改此專案參與的 AI、模型與推理強度")
+    p.add_argument("--enable", help="啟用的 AI，逗號分隔")
+    p.add_argument("--disable", help="停用的 AI，逗號分隔")
+    p.add_argument("--model", action="append", help="例如 --model codex=gpt-6.1-sol；值為 default 表示改回 CLI 預設")
+    p.add_argument("--effort", action="append", help="例如 --effort claude=high；值為 default 表示改回 CLI 預設")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_parties)
+
+    p = sub.add_parser("models", help="各 AI 可選的模型與推理強度")
+    p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser("install", help="把 Agora 裝進工作區（啟用中 AI 的 skills、hooks、權限、.gitignore）")
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("_work", help=argparse.SUPPRESS)

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agoralib import quota  # noqa: E402
+from agoralib import config, quota  # noqa: E402
 
 STATE_FILE = quota.AGORA_HOME / "hook_state.json"
 NAMES = quota.LABELS
@@ -57,6 +57,13 @@ def advice(me: str, usages: dict) -> tuple[str | None, str | None]:
         f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}，安排自己在重置後喚醒，然後停止工作。")
 
 
+def project_parties() -> list:
+    """目前專案啟用的 AI：只在這些 AI 之間提醒交接（找不到專案設定時視為全部啟用）"""
+    start = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("AGORA_WORKSPACE") or os.getcwd()
+    root = config.find_root(Path(start).resolve())
+    return config.enabled(root) if root else list(quota.USAGE)
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "claude-prompt"
     (quota.AGORA_HOME / f"last_hook_{mode}").touch()  # 診斷用：確認 hook 有在執行
@@ -68,12 +75,13 @@ def main():
     except Exception:
         payload = {}
 
-    usages = quota.all_usage()
+    me = "antigravity" if mode.startswith("agy") else "claude"
+    parties = set(project_parties()) | {me}
+    usages = {p: u for p, u in quota.all_usage().items() if p in parties}
     max_age = quota.wanted_max_age(*usages.values())
-    if any(quota.is_stale(usages[p], max_age) for p in ("claude", "antigravity")):
+    if any(quota.is_stale(usages[p], max_age) for p in ("claude", "antigravity") if p in usages):
         quota.refresh_in_background()
 
-    me = "antigravity" if mode.startswith("agy") else "claude"
     level, text = advice(me, usages)
     status = "【額度】" + "｜".join(quota.describe(NAMES[k], u) for k, u in usages.items())
 

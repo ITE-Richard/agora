@@ -18,7 +18,7 @@ description: 額度快用完時把工作交接給還有額度的 AI（Antigravit
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `new` 一個）：
    ```bash
-   python D:/github/agora/agora.py assign <thread> --from claude --file <交接單路徑>   # 不指定 --to 會挑額度最多的一方
+   python D:/github/agora/agora.py assign <thread> --from claude --file <交接單路徑>   # 不指定 --to 會在此專案啟用的 AI 中挑額度最多的一方
    ```
 4. 安排自己在重置後喚醒：用 CronCreate 建立一次性排程，時間設在 Claude 重置時間後 3 分鐘，prompt 寫：
    `額度已重置：依 relay skill 的 C 段收回 <thread> 的工作並繼續。`

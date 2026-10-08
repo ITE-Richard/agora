@@ -109,6 +109,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         cmd += ["--resume", session_id]
     if opts.get("model"):
         cmd += ["--model", opts["model"]]
+    if opts.get("effort"):
+        cmd += ["--effort", opts["effort"]]
     events, stderr = _run(cmd, workspace, prompt, timeout)
     for e in events:
         if e.get("type") == "rate_limit_event":
@@ -132,6 +134,8 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
     cmd = [quota.find_codex(), "exec", "--json", "-s", sandbox, "-C", str(workspace), "--skip-git-repo-check"]
     if opts.get("model"):
         cmd += ["-m", opts["model"]]
+    if opts.get("effort"):
+        cmd += ["-c", f'model_reasoning_effort="{opts["effort"]}"']
     cmd += ["resume", session_id, "-"] if session_id else ["-"]
     events, stderr = _run(cmd, workspace, prompt, timeout)
     thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), session_id)

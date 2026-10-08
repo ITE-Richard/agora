@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agoralib import cli, quota, quota_hook  # noqa: E402
+from agoralib import cli, config, quota, quota_hook  # noqa: E402
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
 
@@ -111,6 +111,63 @@ class TestInstall(unittest.TestCase):
             self.assertEqual(len(allow), len(set(allow)))
             self.assertEqual((Path(tmp) / ".gitignore").read_text(encoding="utf-8").count(".agora/"), 1)
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
+
+    def test_install_skips_disabled_parties(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            config.update_parties(Path(tmp), disable=["antigravity", "codex"])
+            with patch.object(Path, "home", return_value=Path(home)):
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+            self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
+            self.assertFalse((Path(tmp) / ".agents").exists())
+            self.assertFalse((Path(tmp) / "AGENTS.md").exists())
+            self.assertFalse((Path(home) / ".gemini").exists())
+
+
+class TestPartySettings(unittest.TestCase):
+    def test_defaults_to_all_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(config.enabled(Path(tmp)), ["claude", "antigravity", "codex"])
+
+    def test_update_and_clear_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config.update_parties(root, disable=["antigravity"], models={"codex": "gpt-x"}, efforts={"claude": "high"})
+            self.assertEqual(config.enabled(root), ["claude", "codex"])
+            s = config.party_settings(root)
+            self.assertEqual((s["codex"]["model"], s["claude"]["effort"]), ("gpt-x", "high"))
+            config.update_parties(root, models={"codex": "default"})
+            self.assertIsNone(config.party_settings(root)["codex"]["model"])
+
+    def test_cannot_disable_everyone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                config.update_parties(Path(tmp), disable=["claude", "antigravity", "codex"])
+            self.assertFalse(config.config_path(Path(tmp)).exists())
+
+    def test_thread_model_overrides_project_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            config.update_parties(ws.root, models={"codex": "proj-model", "claude": "opus"}, efforts={"codex": "low"})
+            s = state_with(["claude", "codex"])
+            s["parties"]["codex"]["model"] = "thread-model"
+            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low"})
+            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None})
+
+    def test_disabled_party_is_not_asked_to_reply(self):
+        s = state_with(["claude", "antigravity", "codex"])
+        self.assertEqual(cli.targets_for(s, "claude", None, ["claude", "codex"]), ["codex"])
+        with self.assertRaises(SystemExit):
+            cli.targets_for(s, HUMAN, "antigravity", ["claude", "codex"])
+
+    def test_hook_only_hands_off_within_project(self):
+        u = lambda pct: {"remaining_pct": pct, "resets_at": time.time() + 3600, "updated_at": time.time()}  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            config.update_parties(Path(tmp), disable=["codex"])
+            with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": tmp}):
+                parties = quota_hook.project_parties()
+        self.assertEqual(parties, ["claude", "antigravity"])
+        usages = {p: x for p, x in {"claude": u(3), "antigravity": u(40), "codex": u(90)}.items() if p in parties}
+        self.assertIn("交接給 Antigravity", quota_hook.advice("claude", usages)[1])
 
 
 if __name__ == "__main__":

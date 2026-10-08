@@ -11,7 +11,7 @@ description: 透過 Agora 與 Antigravity、Codex 進行多輪技術討論、分
 ## 發起討論
 
 1. 先自己讀相關程式碼，整理出立場與依據，不要把未查證的說法丟給別人。
-2. 建立討論串並送出開場（預設三方都參與；`--parties claude,codex` 可指定）：
+2. 建立討論串並送出開場（預設為此專案啟用的 AI，見 `agora.py parties`；`--parties claude,codex` 可再縮小範圍）：
 
 ```bash
 T=$(python D:/github/agora/agora.py new "主題")

@@ -2,6 +2,8 @@
 
 讓 VSCode 裡的 **Claude Code、Antigravity、Codex** 在同一個專案裡互相討論、分派工作、完成任務；使用者隨時可以閱讀逐字稿或插話。也負責三方的額度監控：某一方快用完時，自動把工作交接給還有額度的一方。
 
+每個專案可以選擇讓哪幾個 AI 參與、各用哪個模型（`agora parties`，或 [VSCode 擴充套件](vscode/README.md) 的側邊欄面板）。
+
 ## 運作方式
 
 - 每個 AI 都透過自己的非互動 CLI 被呼叫：`claude -p`、`agy -p`、`codex exec`。
@@ -16,13 +18,16 @@
 ```bash
 A="python D:/github/agora/agora.py"
 
-$A new "主題" [--parties claude,antigravity,codex] [--model codex=gpt-5]
+$A parties                                          # 此專案參與的 AI 與模型
+$A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
+$A models [--refresh]                               # 各 AI 可選的模型與推理強度
+$A new "主題" [--parties claude,codex] [--model codex=gpt-5] [--effort codex=high]
 $A send <id> --from claude --message "..."          # 預設依序請其他所有 AI 回覆
 $A send <id> --from claude --to codex --file msg.md # 只請 Codex
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言
-$A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則挑額度最多的）
+$A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則在啟用的 AI 中挑額度最多的）
 $A status <id> [--wait 900]                         # 分派狀態與最新進度
 $A recall <id>                                      # 請接手方在下一個檢查點暫停
 $A check                                            # 工作區驗證（語法檢查＋測試）
@@ -32,6 +37,20 @@ $A list / show <id> --last 3
 
 `<id>` 可以用前綴或 `latest`。沒給 `--message` / `--file` 時讀 stdin。
 
+## 參與的 AI 與模型
+
+設定存在工作區的 `.agora/config.json`（`parties` 區段），沒設定的 AI 視為參與、模型與推理強度沿用各 CLI 的預設：
+
+- 未參與的 AI 不會被請求回覆、不會被挑為接手方；額度 hook 也只在參與的 AI 之間提醒交接。設定改了，既有討論串下一次呼叫就生效。
+- 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
+- `install` 只安裝參與中 AI 的 skills、hook 與權限。
+
+| AI | 模型清單來源 | 推理強度 |
+|---|---|---|
+| Claude Code | 官方別名 fable / opus / sonnet / haiku（也可輸入完整模型名稱） | `--effort` |
+| Antigravity | `agy models` | 已包含在模型名稱（例如 `gemini-3.1-pro-high`） |
+| Codex | `~/.codex/models_cache.json`（沒有時用 `codex debug models`） | `model_reasoning_effort`，依模型支援的等級 |
+
 ## 額度
 
 | AI | 來源 |
@@ -40,7 +59,7 @@ $A list / show <id> --last 3
 | Antigravity | 向執行中的 agy hub / language server（本機 loopback）呼叫 `GetUserStatus`，同 Quota Deck |
 | Codex | 讀 `~/.codex/sessions/**/rollout-*.jsonl` 最後一筆 `rate_limits`，不需額外請求 |
 
-快取在 `~/.agora/`。`agoralib/quota_hook.py` 是給 Claude Code（UserPromptSubmit、PostToolUse）與 Antigravity（PreInvocation）用的 hook：每次附上三方額度，自己低於 5% 時提醒把工作交給額度最多的一方。
+快取在 `~/.agora/`。`agoralib/quota_hook.py` 是給 Claude Code（UserPromptSubmit、PostToolUse）與 Antigravity（PreInvocation）用的 hook：每次附上參與中 AI 的額度，自己低於 5% 時提醒把工作交給額度最多的一方。
 
 ## 權限與安全
 
@@ -65,16 +84,19 @@ $A list / show <id> --last 3
 | `AGORA_QUOTA_THRESHOLD` | 5（%） |
 | `AGORA_AGY_POOL` | gemini（Antigravity 內 Gemini 與 Claude 模型是不同額度池） |
 
-工作區的 `.agora/config.json` 可設定 `check` 指令，例如 `{"check": ["python", "-m", "unittest", "discover", "-s", "tests"]}`。
+工作區的 `.agora/config.json` 可設定 `check` 指令，例如 `{"check": ["python", "-m", "unittest", "discover", "-s", "tests"]}`；參與的 AI 與模型見上方。
 
 ## 專案結構
 
 ```
 agora.py               進入點
 agoralib/cli.py        討論、分派、狀態、驗證
+agoralib/config.py     工作區設定（參與的 AI、模型、推理強度）
+agoralib/models.py     各 AI 可選的模型
 agoralib/parties.py    三方 CLI 呼叫
 agoralib/quota.py      三方額度
 agoralib/quota_hook.py 額度提醒 hook
 agoralib/statusline.py Claude Code status line（選用）
 skills/                各 AI 的使用說明（claude、antigravity 的 skill；codex 的 AGENTS.md 片段）
+vscode/                VSCode 擴充套件（側邊欄：AI 與模型、討論串；狀態列額度）
 ```
