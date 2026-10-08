@@ -44,7 +44,10 @@ THRESHOLD_PCT = float(os.getenv("AGORA_QUOTA_THRESHOLD", "5"))
 AGY_POOL = os.getenv("AGORA_AGY_POOL", "gemini")
 PROBE_ENV = "AGORA_PROBE"
 
-AGORA_HOME.mkdir(exist_ok=True)
+try:
+    AGORA_HOME.mkdir(exist_ok=True)
+except OSError:  # 沙箱內的接手方可能無權建立
+    pass
 
 
 def _write_json(path: Path, data: dict):
@@ -325,9 +328,14 @@ def antigravity_usage() -> dict | None:
 
 def refresh(force: bool = False, min_interval: int = 60) -> None:
     """重新查詢兩方並寫入快取；多個呼叫者同時觸發時只跑一次"""
+    if os.getenv("AGORA_INVOKED"):
+        return  # 接手方常在沙箱裡（如 Codex workspace-write），寫不到 ~/.agora；只讀快取，由主程序負責更新
     if not force and REFRESH_LOCK.exists() and time.time() - REFRESH_LOCK.stat().st_mtime < min_interval:
         return
-    REFRESH_LOCK.write_text(str(os.getpid()))
+    try:
+        REFRESH_LOCK.write_text(str(os.getpid()))
+    except OSError:
+        return
     agy = query_antigravity()
     if agy:
         _write_json(AGY_CACHE, agy)
