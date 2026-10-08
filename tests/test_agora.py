@@ -428,5 +428,16 @@ class TestLock(unittest.TestCase):
             self.assertGreaterEqual(stat_calls, 1)
 
 
+class TestVersion(unittest.TestCase):
+    def test_version_defined_and_cli_flag(self):
+        from agoralib import __version__
+        self.assertEqual(__version__, "0.1.0")
+        out = io.StringIO()
+        with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
+            cli.main(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("0.1.0", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

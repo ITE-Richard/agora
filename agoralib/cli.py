@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from agoralib import config, jobs, models, prune, quota, shares
+from agoralib import __version__, config, jobs, models, prune, quota, shares
 from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               NESTED_ENV, CallError, canonical)
 
@@ -971,6 +971,7 @@ def main(argv=None):
             except Exception:
                 pass
     parser = argparse.ArgumentParser(prog="agora", description="Claude Code ⇄ Antigravity ⇄ Codex 討論與分派工作")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--workspace", help="工作區（預設：目前資料夾的 git 根目錄）")
     sub = parser.add_subparsers(dest="command", required=True)
     who = list(AI_PARTIES) + [HUMAN, "richard"]
