@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -122,6 +123,20 @@ class TestInstall(unittest.TestCase):
             self.assertFalse((Path(tmp) / ".agents").exists())
             self.assertFalse((Path(tmp) / "AGENTS.md").exists())
             self.assertFalse((Path(home) / ".gemini").exists())
+
+    def test_install_substitutes_custom_agora_root(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as custom_agora:
+            ws = cli.Workspace(Path(tmp))
+            custom_root = Path(custom_agora)
+            shutil.copytree(cli.AGORA_ROOT_DIR / "skills", custom_root / "skills")
+            (custom_root / "agoralib").mkdir()
+            shutil.copyfile(cli.AGORA_ROOT_DIR / "agoralib" / "quota_hook.py", custom_root / "agoralib" / "quota_hook.py")
+            with patch.object(Path, "home", return_value=Path(home)), patch.object(cli, "AGORA_ROOT_DIR", custom_root):
+                cli.cmd_install(ws, None)
+            skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn(custom_root.as_posix(), skill)
+            agents = (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn(custom_root.as_posix(), agents)
 
 
 class TestPartySettings(unittest.TestCase):
@@ -386,6 +401,31 @@ class TestCliResolvers(unittest.TestCase):
         from agoralib import parties
         with patch.dict(os.environ, {"AGY_PATH": "/custom/agy"}):
             self.assertEqual(parties.find_agy(), "/custom/agy")
+
+
+class TestLock(unittest.TestCase):
+    def test_thread_lock_handles_vanished_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = Path(tmp)
+            lock = thread / ".lock"
+            lock.touch()
+            # 模擬另一進程在 FileExists 後正好刪除鎖
+            orig_stat = Path.stat
+            stat_calls = 0
+
+            def flaky_stat(*args, **kwargs):
+                nonlocal stat_calls
+                stat_calls += 1
+                if stat_calls == 1:
+                    lock.unlink(missing_ok=True)
+                    raise FileNotFoundError("Lock file deleted concurrently")
+                return orig_stat(lock, *args, **kwargs)
+
+            with patch.object(Path, "stat", side_effect=flaky_stat):
+                with cli.thread_lock(thread, wait=5):
+                    self.assertTrue(lock.exists())
+            self.assertFalse(lock.exists())
+            self.assertGreaterEqual(stat_calls, 1)
 
 
 if __name__ == "__main__":

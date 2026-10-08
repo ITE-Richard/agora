@@ -30,7 +30,18 @@ AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
 
 
 def last_activity(thread: Path) -> float:
-    return max((p.stat().st_mtime for p in thread.rglob("*") if p.is_file()), default=thread.stat().st_mtime)
+    times = []
+    for p in thread.rglob("*"):
+        try:
+            if p.is_file():
+                times.append(p.stat().st_mtime)
+        except OSError:
+            pass
+    try:
+        fallback = thread.stat().st_mtime
+    except OSError:
+        fallback = time.time()
+    return max(times, default=fallback)
 
 
 def sessions_of(state: dict) -> List[Tuple[str, str]]:
@@ -71,7 +82,13 @@ def scan(threads: List[Path], days: Optional[float]) -> Tuple[List[dict], List[d
         except Exception:
             kept.append({"id": thread.name, "topic": "?", "reason": "state.json 無法讀取"})
             continue
-        size = sum(p.stat().st_size for p in thread.rglob("*") if p.is_file())
+        size = 0
+        for p in thread.rglob("*"):
+            try:
+                if p.is_file():
+                    size += p.stat().st_size
+            except OSError:
+                pass
         info = {"id": thread.name, "topic": state.get("topic", ""), "messages": len(state.get("messages", [])),
                 "idle_days": round((time.time() - last_activity(thread)) / 86400, 1), "bytes": size,
                 "sessions": [{"party": p, "id": i} for p, i in sessions_of(state)]}

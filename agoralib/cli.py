@@ -151,8 +151,11 @@ def thread_lock(thread: Path, wait: int = 30):
             os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
             break
         except FileExistsError:
-            if time.time() - lock.stat().st_mtime > TIMEOUT + 120:
-                lock.unlink(missing_ok=True)
+            try:
+                if time.time() - lock.stat().st_mtime > TIMEOUT + 120:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
                 continue
             if time.time() > deadline:
                 sys.exit("此討論串正在等待回覆，請稍後再試。")
@@ -343,8 +346,11 @@ def in_background(ws: Workspace, thread: Path, kind: str, argv: List[str], text:
         sys.exit(f"此討論串已有進行中的討論（{NAMES.get(job.get('current'), '啟動中')}），"
                  f"用 agora wait {thread.name} 查看，或 agora stop {thread.name} 停止。")
     lock = thread / ".lock"
-    if lock.exists() and time.time() - lock.stat().st_mtime > 30 and not state_relay_active(thread):
-        lock.unlink(missing_ok=True)   # 上一個討論程序被強制結束時留下的鎖
+    try:
+        if lock.exists() and time.time() - lock.stat().st_mtime > 30 and not state_relay_active(thread):
+            lock.unlink(missing_ok=True)   # 上一個討論程序被強制結束時留下的鎖
+    except OSError:
+        pass
     if text is not None:
         (thread / "job_input.md").write_text(text, encoding="utf-8")
         argv = argv + ["--file", str(thread / "job_input.md")]
@@ -892,13 +898,16 @@ def cmd_install(ws: Workspace, args):
         for skill in ("agora", "relay"):
             target = dest / skill
             target.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / "skills" / agent / skill / "SKILL.md", target / "SKILL.md")
+            content = (root / "skills" / agent / skill / "SKILL.md").read_text(encoding="utf-8")
+            content = content.replace("D:/github/agora", root.as_posix())
+            (target / "SKILL.md").write_text(content, encoding="utf-8")
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
     if "codex" in enabled:
         agents_md = ws.root / "AGENTS.md"
         section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
+        section = section.replace("D:/github/agora", root.as_posix())
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
         text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
             if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
