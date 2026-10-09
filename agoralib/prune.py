@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from agoralib import quota
+from agoralib import quota, snapshot
 
 FINISHED_RELAY = ("done",)
 AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
@@ -164,6 +164,10 @@ def delete_thread(thread: Path, info: dict, with_sessions: bool) -> Dict[str, li
                 done.append(f"{party} {sid}：{deleter(sid)}")
             except Exception as e:
                 errors.append(f"{party} {sid}：{e}")
+    try:   # 分派基準 refs/agora/<討論串>（討論串在 <工作區>/.agora/threads/ 下）
+        snapshot.delete(thread.parents[2], thread.name)
+    except Exception as e:
+        errors.append(f"分派基準 {snapshot.REF_PREFIX}{thread.name}：{e}")
     shutil.rmtree(thread)
     return {"done": done, "errors": errors}
 

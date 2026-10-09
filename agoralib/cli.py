@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from agoralib import __version__, config, jobs, models, prune, quota, shares
+from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               NESTED_ENV, CallError, canonical)
 
@@ -493,13 +493,19 @@ def cmd_assign(ws: Workspace, args):
     with open(paths["progress"], "a", encoding="utf-8") as f:
         f.write(f"\n## {now_str()} · {NAMES[owner]} 分派給 {NAMES[worker]}\n\n{text.strip()}\n")
 
+    # 分派基準：之後用 agora changes 比對分派期間的變更（不影響使用者的 index 與工作區）
+    try:
+        baseline = snapshot.create(ws.root, thread.name)
+    except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
+        baseline = {"error": str(e)}
+
     with thread_lock(thread):
         state = load_state(thread)
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           "session_id": args.session, "external_session": args.session,
                           "handoff": text.strip(), "started": now_str(),
-                          "updated": now_str()}
+                          "updated": now_str(), "baseline": baseline}
         save_state(thread, state)
 
     entry = AGORA_ROOT_DIR / "agora.py"
@@ -507,8 +513,36 @@ def cmd_assign(ws: Workspace, args):
                      ws.root, paths["log"], paths["log"], append=True)
     update_relay(thread, pid=pid)
     print(f"已分派給 {NAMES[worker]}（背景程序 PID {pid}，關閉視窗也會繼續）。")
+    if baseline.get("error"):
+        print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
     print(f"進度：{paths['progress']}")
     print(f"查詢：python {entry.as_posix()} status {thread.name} --wait 900")
+
+
+def cmd_changes(ws: Workspace, args):
+    """分派期間的變更：相對於 assign 當下的工作區快照（期間任何人的修改都會列出）"""
+    thread = ws.resolve_thread(args.thread)
+    relay = load_state(thread).get("relay") or {}
+    base = relay.get("baseline") or {}
+    if not base.get("commit"):
+        sys.exit("此討論串的分派沒有記錄基準" + (f"：{base['error']}" if base.get("error") else "（尚未分派，或是舊版的分派）。"))
+    try:
+        files = snapshot.changes(ws.root, base["commit"])
+    except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
+        sys.exit(str(e))
+    if args.json:
+        print(json.dumps({"baseline": base["commit"], "ref": base.get("ref"), "since": relay.get("started"),
+                          "worker": relay.get("worker"), "status": relay.get("status"), "files": files},
+                         ensure_ascii=False, indent=2))
+        return
+    print(f"分派期間的變更（{relay.get('started')} 起，{NAMES.get(relay.get('worker'), '接手方')} 接手；"
+          f"期間任何人的修改都會列出）：")
+    if not files:
+        print("  沒有變更。")
+    for f in files:
+        print(f"  {snapshot.STATUS.get(f['status'], f['status'])}  {f['path']}")
+    if files:
+        print(f"\n查看內容：git diff {base['commit'][:12]} -- <檔案>（未追蹤的新檔不在 git diff 內）")
 
 
 def sleep_until(thread: Path, ts: float) -> bool:
@@ -1032,6 +1066,11 @@ def main(argv=None):
         p.add_argument("thread")
         p.add_argument("--wait", type=int, help="最多等待幾秒，直到接手程序結束")
         p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("changes", help="分派期間的變更（相對於分派當下的工作區快照）")
+    p.add_argument("thread")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_changes)
 
     p = sub.add_parser("recall", help="請接手方在下一個檢查點暫停")
     p.add_argument("thread")

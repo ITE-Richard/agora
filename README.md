@@ -32,6 +32,7 @@ $A reply <id> --party antigravity                   # 不發言，直接請某�
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
 $A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則依分配比例挑選）
 $A status <id> [--wait 900]                         # 分派狀態與最新進度
+$A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A recall <id>                                      # 請接手方在下一個檢查點暫停
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A quota [--refresh] [--json]                       # 三方剩餘額度
@@ -105,6 +106,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | Antigravity | 沒有寫檔權限 | `--mode accept-edits`（只能寫工作區）；指令依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） |
 | Codex | `-s read-only` | `-s workspace-write`（只能寫工作區） |
 
+- 分派時用暫時的 git index 替工作區拍快照，存在 `refs/agora/<討論串>`（不動使用者的 index 與工作區；被忽略的檔案與 `.env`、金鑰不進快照），`changes` 與 VSCode 的「檢視分派期間的變更」以它為基準；清理討論串時一併刪除。期間任何人的修改都會列出。
 - 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
 - Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`git status/diff/log`。

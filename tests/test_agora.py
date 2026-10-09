@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agoralib import cli, config, jobs, prune, quota, quota_hook, shares  # noqa: E402
+from agoralib import cli, config, jobs, prune, quota, quota_hook, shares, snapshot  # noqa: E402
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
 
@@ -83,6 +84,117 @@ class TestConsensus(unittest.TestCase):
                 os.environ.pop(cli.NESTED_ENV, None)
                 cli.cmd_auto(ws, args)
         self.assertEqual(calls, ["claude", "codex", "claude", "codex"])
+
+
+def git(root, *args):
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8",
+                          check=True).stdout
+
+
+def make_repo(tmp) -> Path:
+    root = Path(tmp)
+    git(root, "init", "-q")
+    git(root, "config", "user.name", "t")
+    git(root, "config", "user.email", "t@t")
+    (root / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    (root / "a.txt").write_text("a\n", encoding="utf-8")
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "init")
+    return root
+
+
+class TestSnapshot(unittest.TestCase):
+    def test_snapshot_keeps_user_index_and_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            (root / "a.txt").write_text("a2\n", encoding="utf-8")
+            (root / "staged.txt").write_text("s\n", encoding="utf-8")
+            git(root, "add", "staged.txt")
+            index = root / ".git" / "index"
+            before_index, before_status = index.read_bytes(), git(root, "status", "--porcelain")
+            snapshot.create(root, "t1")
+            self.assertEqual(index.read_bytes(), before_index)
+            self.assertEqual(git(root, "status", "--porcelain"), before_status)
+
+    def test_snapshot_contents_and_secret_exclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            (root / "old_untracked.txt").write_text("u\n", encoding="utf-8")
+            (root / ".env").write_text("SECRET=changed\n", encoding="utf-8")   # 已追蹤的機密檔
+            (root / "ignored").mkdir()
+            (root / "ignored" / "x.txt").write_text("x\n", encoding="utf-8")
+            (root / ".agora").mkdir()
+            (root / ".agora" / "state.json").write_text("{}", encoding="utf-8")
+            base = snapshot.create(root, "t1")
+            files = git(root, "ls-tree", "-r", "--name-only", base["commit"]).split()
+            self.assertIn("old_untracked.txt", files)
+            self.assertNotIn(".env", files)
+            self.assertNotIn("ignored/x.txt", files)
+            self.assertFalse(any(f.startswith(".agora") for f in files))
+            self.assertEqual(git(root, "rev-parse", "refs/agora/t1").strip(), base["commit"])
+
+    def test_changes_only_lists_changes_during_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            (root / "a.txt").write_text("改到一半\n", encoding="utf-8")       # 分派前就有的修改
+            (root / "draft.txt").write_text("草稿\n", encoding="utf-8")     # 分派前就有的未追蹤檔
+            base = snapshot.create(root, "t1")
+            self.assertEqual(snapshot.changes(root, base["commit"]), [])
+            (root / "draft.txt").write_text("接手方改過\n", encoding="utf-8")
+            (root / "new.txt").write_text("n\n", encoding="utf-8")
+            (root / "a.txt").unlink()
+            (root / ".env").write_text("SECRET=2\n", encoding="utf-8")
+            got = {c["path"]: c["status"] for c in snapshot.changes(root, base["commit"])}
+            self.assertEqual(got, {"draft.txt": "M", "new.txt": "A", "a.txt": "D"})
+
+    def test_delete_ref_and_missing_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            base = snapshot.create(root, "t1")
+            snapshot.delete(root, "t1")
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--verify", "-q", "refs/agora/t1"], cwd=root,
+                                            capture_output=True).returncode, 1)
+            snapshot.delete(root, "t1")   # 不存在時略過
+            with self.assertRaises(snapshot.SnapshotError):
+                snapshot.changes(root, "0" * 40)
+            self.assertTrue(base["commit"])
+
+    def test_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(snapshot.SnapshotError):
+                snapshot.create(Path(tmp), "t1")
+
+    def test_changes_command_and_prune_removes_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            ws = cli.Workspace(root)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex"])
+            state["relay"] = {"worker": "codex", "status": "done", "started": "now",
+                              "baseline": snapshot.create(root, "t1")}
+            cli.save_state(thread, state)
+            (root / "new.txt").write_text("n\n", encoding="utf-8")
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_changes(ws, type("Args", (), {"thread": "t1", "json": True})())
+            self.assertEqual(json.loads(out.getvalue())["files"], [{"status": "A", "path": "new.txt"}])
+            prune.delete_thread(thread, {"sessions": []}, with_sessions=False)
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--verify", "-q", "refs/agora/t1"], cwd=root,
+                                            capture_output=True).returncode, 1)
+
+    def test_changes_without_baseline_explains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["codex"])
+            state["relay"] = {"worker": "codex", "status": "done", "baseline": {"error": "工作區不是 git repo"}}
+            cli.save_state(thread, state)
+            with self.assertRaises(SystemExit) as ctx:
+                cli.cmd_changes(ws, type("Args", (), {"thread": "t1", "json": False})())
+            self.assertIn("不是 git repo", str(ctx.exception.code))
 
 
 class TestAntigravityMode(unittest.TestCase):
