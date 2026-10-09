@@ -619,6 +619,28 @@ class TestInstall(unittest.TestCase):
             agents = (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(custom_root.as_posix(), agents)
 
+    def test_install_quotes_agora_path_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as parent:
+            custom_root = Path(parent) / "Richard Clayd" / ".agora" / "core"
+            shutil.copytree(cli.AGORA_ROOT_DIR / "skills", custom_root / "skills")
+            (custom_root / "agoralib").mkdir()
+            with patch.object(Path, "home", return_value=Path(home)), patch.object(cli, "AGORA_ROOT_DIR", custom_root), \
+                    patch.object(parties, "_CMD", parties.LEGACY_CMD):
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+            quoted = f'python "{custom_root.as_posix()}/agora.py"'
+            skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn(f"T=$({quoted} new", skill)
+            hooks = (Path(tmp) / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+            self.assertIn('quota_hook.py\\" claude-prompt', hooks)          # JSON 內的引號
+            allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
+                               .read_text(encoding="utf-8"))["permissions"]["allow"]
+            self.assertIn(f"command({quoted} quota)", allow)
+
+    def test_quote_path(self):
+        self.assertEqual(parties.quote_path("D:/github/agora/agora.py"), "D:/github/agora/agora.py")
+        self.assertEqual(parties.quote_path("C:/Users/A B/x.py"), '"C:/Users/A B/x.py"')
+
 
 class TestPartySettings(unittest.TestCase):
     def test_defaults_to_all_enabled(self):
@@ -940,12 +962,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.1")
+        self.assertEqual(__version__, "0.2.2")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.1", out.getvalue())
+        self.assertIn("0.2.2", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

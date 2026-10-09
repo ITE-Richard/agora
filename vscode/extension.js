@@ -6,6 +6,7 @@ const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const editorCtx = require("./context");
+const { syncCore } = require("./core");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const EXTENSION_VERSION = require("./package.json").version;
@@ -19,17 +20,16 @@ const RELAY_LABELS = {
 
 let output;
 let extensionPath;
+let bundledCore;   // 內建核心同步到 ~/.agora/core 後的位置（activate 時設定）
 
 // ───────────────────────── 執行 agora.py ─────────────────────────
 
+/** 明確指定的 Agora 位置：設定 agora.root，或直接從 repo 載入擴充套件（開發模式） */
 function agoraRoot() {
   const configured = vscode.workspace.getConfiguration("agora").get("root");
   const candidates = [configured];
   try {
-    candidates.push(JSON.parse(fs.readFileSync(path.join(extensionPath, "agora-root.json"), "utf8")).root);
-  } catch {}
-  try {
-    candidates.push(path.resolve(fs.realpathSync(extensionPath), ".."));   // 直接從 repo 載入（開發模式）
+    candidates.push(path.resolve(fs.realpathSync(extensionPath), ".."));
   } catch {}
   return candidates.find((c) => c && fs.existsSync(path.join(c, "agora.py")));
 }
@@ -45,15 +45,15 @@ function findOnPath(name) {
   return undefined;
 }
 
-/** 執行 Agora 的方式：agora.root（或打包時記錄的位置）的 agora.py，找不到時用 PATH 上的 agora 指令（pip install -e） */
+/** 執行 Agora 的方式，依序：設定 agora.root → PATH 上的 agora 指令（pip install -e）→ 擴充套件內建的核心 */
 function agoraCommand() {
+  const python = vscode.workspace.getConfiguration("agora").get("pythonPath") || "python";
   const root = agoraRoot();
-  if (root) {
-    const python = vscode.workspace.getConfiguration("agora").get("pythonPath") || "python";
-    return { cmd: python, prefix: [path.join(root, "agora.py")] };
-  }
+  if (root) return { cmd: python, prefix: [path.join(root, "agora.py")], source: root };
   const exe = findOnPath("agora");
-  return exe ? { cmd: exe, prefix: [] } : undefined;
+  if (exe) return { cmd: exe, prefix: [], source: exe };
+  if (bundledCore) return { cmd: python, prefix: [path.join(bundledCore, "agora.py")], source: bundledCore };
+  return undefined;
 }
 
 function workspaceRoot() {
@@ -76,7 +76,7 @@ function runAgora(args, { input, token, onProgress, log = true } = {}) {
   const agora = agoraCommand();
   const ws = workspaceRoot();
   if (!agora) {
-    return Promise.reject(new AgoraError("找不到 Agora：請執行 pip install -e <Agora 資料夾>，或在設定 agora.root 指定 Agora 程式所在的資料夾。"));
+    return Promise.reject(new AgoraError("找不到 Agora：擴充套件內建的核心無法使用，請在設定 agora.root 指定 Agora 程式所在的資料夾，或執行 pip install -e <Agora 資料夾>。"));
   }
   if (!ws) {
     return Promise.reject(new AgoraError("請先開啟一個資料夾。"));
@@ -603,6 +603,11 @@ class PartiesView {
 function activate(context) {
   extensionPath = context.extensionPath;
   output = vscode.window.createOutputChannel("Agora");
+  try {
+    bundledCore = syncCore(path.join(extensionPath, "core"), undefined, (m) => output.appendLine(m));
+  } catch (e) {
+    output.appendLine(`無法準備內建的 Agora 核心：${e.message}`);
+  }
   const model = new Model();
   const activity = new Activity();
   const threads = new ThreadsProvider(activity);

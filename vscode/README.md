@@ -20,20 +20,34 @@
 
 ## 安裝
 
+只需要 Python 3.9 以上與這個擴充套件：
+
 ```bash
-cd D:/github/agora/vscode
-npm run package                       # 產生 agora-0.2.1.vsix，並記錄 Agora 程式的位置
-code --install-extension agora-0.2.1.vsix
+code --install-extension agora-0.2.2.vsix     # 從 GitHub Release 下載
 ```
 
-Agora 程式搬家時，重新打包或在設定 `agora.root` 指定新位置。
-找不到 `agora.py` 時，擴充套件會改用 PATH 上的 `agora` 指令（`pip install -e <Agora 資料夾>`）。
+擴充套件內建 Agora 核心（`agora.py`、`agoralib`、skills），啟動時同步到 `~/.agora/core`。
+用固定位置而不是擴充套件資料夾，是因為擴充套件資料夾的名稱含版本號、每次更新都會變，
+專案裡 skills 與 Antigravity 權限記錄的指令路徑就會失效。擴充套件更新後，核心會自動換成新版。
+
+執行 Agora 的方式依序為：
+
+1. 設定 `agora.root` 指定的資料夾（含 `agora.py`）
+2. PATH 上的 `agora` 指令（在 Agora 原始碼資料夾執行 `pip install -e .`，適合修改 Agora 本身時使用）
+3. 內建的核心（`~/.agora/core`）
+
+自己打包：
+
+```bash
+cd <Agora 資料夾>/vscode
+npm run package          # 先把核心複製進 core/，再產生 agora-<版本>.vsix
+```
 
 ## 設定
 
 | 設定 | 預設 | 說明 |
 |---|---|---|
-| `agora.root` | 打包時記錄的位置 | 含 `agora.py` 的資料夾 |
+| `agora.root` | （空白） | 含 `agora.py` 的資料夾；留空時使用 PATH 上的 `agora` 或內建核心 |
 | `agora.pythonPath` | `python` | 執行 agora.py 的 Python |
 | `agora.quotaRefreshMinutes` | 10 | 狀態列額度更新間隔，0 表示不自動更新 |
 

@@ -2,7 +2,7 @@
   "name": "agora",
   "displayName": "Agora",
   "description": "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論與分工：選擇參與的 AI 與模型、管理討論串、查看額度。",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "richard-jheng",
   "license": "UNLICENSED",
   "private": true,
@@ -289,12 +289,12 @@
         "agora.root": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Agora 程式所在的資料夾（含 `agora.py`）。留空時使用打包擴充套件時記錄的路徑。"
+          "markdownDescription": "Agora 程式所在的資料夾（含 `agora.py`）。留空時依序使用 PATH 上的 `agora` 指令（`pip install -e`）、擴充套件內建的核心（同步到 `~/.agora/core`）。"
         },
         "agora.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "執行 agora.py 的 Python。"
+          "description": "執行 agora.py 的 Python（使用 agora.root 或內建核心時）。"
         },
         "agora.quotaRefreshMinutes": {
           "type": "number",
@@ -306,7 +306,7 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "node scripts/stamp-root.js",
+    "vscode:prepublish": "node scripts/bundle-core.js",
     "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license",
     "test": "node --test \"test/*.test.js\""
   }

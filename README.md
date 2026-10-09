@@ -19,10 +19,16 @@
 
 ## 安裝
 
+只用 VSCode 的話，安裝 [VSCode 擴充套件](vscode/README.md) 即可：它內建 Agora 核心，會同步到 `~/.agora/core`，再從面板「安裝到此專案」。
+
+要在終端機使用，或要修改 Agora 本身：
+
 ```bash
-pip install -e D:/github/agora     # 建議：提供固定的 agora 指令（可編輯安裝，直接使用這份程式）
+pip install -e D:/github/agora     # 提供固定的 agora 指令（可編輯安裝，直接使用這份程式）
 cd <專案資料夾> && agora install    # 安裝 skills、hook、權限與 git 排除
 ```
+
+路徑含空格時（例如 `C:/Users/Richard Clayd/.agora/core`），skills、hook 與權限裡的指令會自動加上引號。
 
 - 用 `pip install -e` 安裝後，skills、接手方的指令權限與工作提示都改用固定的 `agora` 指令，Agora 搬家或更新時不必替每個專案重新 install（額度 hook 仍記錄路徑，搬家後要重新 install）。
 - 沒有安裝時照樣可以用 `python <Agora 資料夾>/agora.py`；Antigravity 的權限會同時保留兩種寫法，已裝過的 skills 不受影響。

@@ -4,5 +4,5 @@ __pycache__/
 *.log
 .env
 vscode/*.vsix
-vscode/agora-root.json
+vscode/core/
 *.egg-info/

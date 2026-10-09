@@ -28,7 +28,8 @@ from typing import List, Optional
 
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
-                              NESTED_ENV, CallError, Live, agora_cmd, canonical)
+                              NESTED_ENV, CallError, Live, agora_cmd, canonical,
+                              quote_path)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -1134,8 +1135,8 @@ def cmd_install(ws: Workspace, args):
     """把 Agora 裝進工作區：啟用中各 AI 的使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設設定"""
     import shutil
     root = AGORA_ROOT_DIR
-    hook = f"python {(root / 'agoralib' / 'quota_hook.py').as_posix()}"
-    legacy = f"python {root.as_posix()}/agora.py"
+    hook = f"python {quote_path((root / 'agoralib' / 'quota_hook.py').as_posix())}"
+    legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
     cmd = agora_cmd() if agora_cmd() == "agora" else legacy   # skills 與權限裡給 AI 用的指令
     done = []
 

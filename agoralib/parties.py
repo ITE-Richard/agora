@@ -25,7 +25,14 @@ from typing import Callable, Dict, Optional, Tuple
 from agoralib import quota
 
 AGORA_ROOT = Path(__file__).resolve().parents[1]
-LEGACY_CMD = f"python {AGORA_ROOT.as_posix()}/agora.py"
+
+
+def quote_path(path: str) -> str:
+    """指令裡的路徑含空格時加引號（例如 C:/Users/Richard Clayd/.agora/core）"""
+    return f'"{path}"' if " " in path else path
+
+
+LEGACY_CMD = f"python {quote_path(AGORA_ROOT.as_posix() + '/agora.py')}"
 DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
 QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|429|resource_exhausted|credits", re.I)
