@@ -497,8 +497,10 @@ def referenced_files(root: Path, text: str) -> dict:
         rel = token.replace("\\", "/")
         rel = rel[2:] if rel.startswith("./") else rel
         path = (top / rel).resolve()
-        # 存在的檔案，或含目錄的路徑（之後才要建立的檔案）；版本號、網址片段之類的不算
-        if top in path.parents and (path.is_file() or ("/" in rel and not path.exists())):
+        # 存在的檔案，或之後才要建立的檔案（含目錄，或副檔名是英文字母開頭，例如 new_module.py）；
+        # 版本號（0.1.1）之類的不算
+        new_file = not path.exists() and ("/" in rel or re.search(r"\.[A-Za-z]\w*$", rel))
+        if top in path.parents and (path.is_file() or new_file):
             out[rel] = file_hash(path)
     return out
 

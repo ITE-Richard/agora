@@ -374,7 +374,8 @@ class BaselineProvider {
     if (q.get("empty")) return "";
     const ws = workspaceRoot();
     return new Promise((resolve, reject) => {
-      cp.execFile("git", ["show", `${q.get("sha")}:${q.get("path")}`], { cwd: ws, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+      // sha:./路徑 以工作區（git 的 cwd）為準，工作區是 repo 子資料夾時也正確
+      cp.execFile("git", ["show", `${q.get("sha")}:./${q.get("path")}`], { cwd: ws, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
         (err, stdout, stderr) => (err
           ? reject(new Error(`無法讀取分派基準中的 ${q.get("path")}：${(stderr || err.message).trim()}`))
           : resolve(stdout)));

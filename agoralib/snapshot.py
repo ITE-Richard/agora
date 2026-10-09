@@ -80,12 +80,13 @@ def create(root: Path, name: str) -> Dict[str, str]:
 
 
 def changes(root: Path, baseline: str) -> List[Dict[str, str]]:
-    """相對於基準有變動的檔案：[{"path", "status"}]，status 為 A / M / D / T"""
+    """相對於基準有變動的檔案：[{"path"（相對於工作區）, "status"}]，status 為 A / M / D / T"""
     if not is_repo(root):
         raise SnapshotError("工作區不是 git repo。")
     if not _ok(root, "cat-file", "-e", f"{baseline}^{{commit}}"):
         raise SnapshotError(f"找不到分派基準 {baseline[:12]}（可能已被刪除）。")
-    out = _git(root, "-c", "core.quotepath=false", "diff", "--name-status", "--no-renames", "-z",
+    # --relative：工作區是 repo 的子資料夾時，只列出工作區內的檔案，路徑相對於工作區
+    out = _git(root, "-c", "core.quotepath=false", "diff", "--name-status", "--no-renames", "--relative", "-z",
                f"{baseline}^{{tree}}", _tree(root))
     parts = [p for p in out.split("\0") if p]
     return [{"status": parts[i][0], "path": parts[i + 1]} for i in range(0, len(parts) - 1, 2)]

@@ -51,9 +51,12 @@ def _installed_here(exe: Path) -> bool:
         if (dist.metadata["Name"] or "").lower() != DIST_NAME:
             continue
         try:
-            url = urlparse(json.loads(dist.read_text("direct_url.json") or "{}").get("url", ""))
+            direct = json.loads(dist.read_text("direct_url.json") or "{}")
         except json.JSONDecodeError:
             continue
+        if not (direct.get("dir_info") or {}).get("editable"):
+            continue   # 一般安裝是複製一份，不一定是這份程式的版本
+        url = urlparse(direct.get("url", ""))
         path = unquote(url.path)
         if re.match(r"^/[A-Za-z]:", path):   # file:///D:/github/agora
             path = path[1:]

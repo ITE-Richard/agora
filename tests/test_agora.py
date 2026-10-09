@@ -123,6 +123,16 @@ class TestSummary(unittest.TestCase):
             self.assertEqual(set(files), {"a.txt", "src/new_module.py"})
             self.assertIsNone(files["src/new_module.py"])
 
+    def test_referenced_files_includes_new_root_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = cli.referenced_files(Path(tmp), "建立 new_module.py，版本改成 0.2.0，見 e.g. 說明")
+            self.assertIn("new_module.py", files)
+            self.assertNotIn("0.2.0", files)
+            state = {"messages": [], "summary": {"messages": 0, "files": files}}
+            self.assertEqual(cli.stale_reasons(Path(tmp), state), [])
+            (Path(tmp) / "new_module.py").write_text("x", encoding="utf-8")   # 總結後有人先建立了
+            self.assertEqual(len(cli.stale_reasons(Path(tmp), state)), 1)
+
     def run_summarize(self, root, reply="", low=()):
         ws = cli.Workspace(root)
         thread = ws.threads / "t1"
@@ -254,6 +264,21 @@ class TestSnapshot(unittest.TestCase):
             (root / ".env").write_text("SECRET=2\n", encoding="utf-8")
             got = {c["path"]: c["status"] for c in snapshot.changes(root, base["commit"])}
             self.assertEqual(got, {"draft.txt": "M", "new.txt": "A", "a.txt": "D"})
+
+    def test_changes_in_subdirectory_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            sub = root / "pkg"
+            sub.mkdir()
+            (sub / "a.py").write_text("1\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "pkg")
+            base = snapshot.create(sub, "t1")
+            (sub / "a.py").write_text("2\n", encoding="utf-8")
+            (root / "outside.txt").write_text("o\n", encoding="utf-8")   # 工作區外的變更不列出
+            self.assertEqual(snapshot.changes(sub, base["commit"]), [{"status": "M", "path": "a.py"}])
+            # 擴充套件以 sha:./路徑 從工作區讀基準內容
+            self.assertEqual(git(sub, "show", f"{base['commit']}:./a.py"), "1\n")
 
     def test_delete_ref_and_missing_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -810,6 +835,26 @@ class TestCliResolvers(unittest.TestCase):
         with patch.object(parties, "_CMD", None), \
                 patch.object(parties.shutil, "which", return_value=str(Path(tempfile.gettempdir()) / "agora.exe")):
             self.assertEqual(parties.agora_cmd(), parties.LEGACY_CMD)   # 不在目前 Python 的 Scripts 底下
+
+    def test_agora_cmd_requires_editable_install_of_this_copy(self):
+        import sysconfig
+        from importlib import metadata
+
+        class Dist:
+            def __init__(self, direct):
+                self.metadata = {"Name": "agora-cli"}
+                self.direct = direct
+
+            def read_text(self, name):
+                return json.dumps(self.direct) if name == "direct_url.json" else None
+
+        url = parties.AGORA_ROOT.as_uri()
+        exe = Path(sysconfig.get_path("scripts")) / "agora.exe"
+        for direct, expected in (({"url": url, "dir_info": {"editable": True}}, True),
+                                 ({"url": url, "dir_info": {}}, False),                    # 一般安裝（複製）
+                                 ({"url": "file:///elsewhere", "dir_info": {"editable": True}}, False)):
+            with patch.object(metadata, "distributions", return_value=[Dist(direct)]):
+                self.assertEqual(parties._installed_here(exe), expected, direct)
 
     def test_find_agy_env_override(self):
         from agoralib import parties
