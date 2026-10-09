@@ -623,7 +623,7 @@ function activate(context) {
     const thread = await pickThread(arg);
     if (!thread) return;
     const rounds = await vscode.window.showInputBox({
-      prompt: "讓 AI 依序自動發言幾輪？（出現【已達成共識】會提前結束）", value: "4",
+      prompt: "讓 AI 依序自動發言幾輪？（各方都表示【已達成共識】會提前結束）", value: "4",
       validateInput: (v) => (/^\d+$/.test(v) && +v > 0 ? undefined : "請輸入正整數"),
     });
     if (!rounds) return;

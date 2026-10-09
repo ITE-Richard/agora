@@ -32,6 +32,7 @@ from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIE
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
 MAX_WORK_ROUNDS = int(os.getenv("AGORA_MAX_WORK_ROUNDS", "12"))
+CONSENSUS = "【已達成共識】"
 
 PREAMBLE = """\
 【Agora 討論環境說明】
@@ -45,6 +46,7 @@ PREAMBLE = """\
 3. 用繁體中文、一般技術文風回覆。
 4. 直接表達立場：同意就說同意並補充，不同意就說明理由；引用程式碼時標出 檔案:行號。對方的論點要先查證再接受。
 5. 回覆盡量控制在 600 字內，結尾用一兩句話總結立場或待解問題；認為已達成共識時寫出「【已達成共識】」與共識內容。
+   要所有參與的 AI 都接連寫出「【已達成共識】」才算達成；你仍有異議時就不要寫，並說明還差什麼。
 
 討論主題：{topic}
 """
@@ -393,6 +395,11 @@ def cmd_reply(ws: Workspace, args):
         print(invoke(ws, thread, load_state(thread), party))
 
 
+def agree(agreed: set, party: str, reply: str) -> set:
+    """共識要所有發言方連續表示同意：有人沒寫「【已達成共識】」就重新計算"""
+    return agreed | {party} if CONSENSUS in reply else set()
+
+
 def cmd_auto(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
@@ -406,13 +413,17 @@ def cmd_auto(ws: Workspace, args):
             sys.exit("此討論串沒有任何啟用中的 AI。")
         last = next((m["speaker"] for m in reversed(state["messages"]) if m["speaker"] in order), None)
         idx = (order.index(last) + 1) % len(order) if last in order else 0
+        agreed = set()
         for i in range(args.rounds):
             party = order[idx]
             reply = invoke(ws, thread, state, party)
             print(f"\n═══ 第 {i + 1}/{args.rounds} 輪 · {NAMES[party]} ═══\n{reply}")
-            if "【已達成共識】" in reply:
-                print("\n（已達成共識，提前結束）")
+            agreed = agree(agreed, party, reply)
+            if agreed >= set(order):
+                print("\n（各方都表示已達成共識，提前結束）")
                 break
+            if agreed:
+                print(f"\n（{'、'.join(NAMES[p] for p in order if p in agreed)} 認為已達成共識，等其他方確認）")
             idx = (idx + 1) % len(order)
 
 
@@ -929,11 +940,14 @@ def cmd_install(ws: Workspace, args):
     def agy_hooks(data):
         data["agora-quota"] = {"PreInvocation": [{"type": "command", "command": f"{hook} agy-pre", "timeout": 15}]}
 
-    # Antigravity CLI 的權限是全域、完整比對：只開放接手方需要的固定指令與此工作區的寫入
+    # Antigravity CLI 的權限是全域、完整比對：只開放接手方需要的固定指令。
+    # 寫檔不放在這裡（否則討論時也能改檔），接手工作時以 --mode accept-edits 開放；舊版加過的寫入規則一併移除。
     def agy_permissions(data):
         allow = data.setdefault("permissions", {}).setdefault("allow", [])
+        old = {f"write_file({ws.root})", f"write_file({ws.root.as_posix()})"}
+        allow[:] = [rule for rule in allow if rule not in old]
         for rule in (f"command({AGORA_CMD} quota)", f"command({AGORA_CMD} check)", "command(git status)",
-                     "command(git diff)", "command(git log)", f"write_file({ws.root})", f"write_file({ws.root.as_posix()})",
+                     "command(git diff)", "command(git log)",
                      f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:
                 allow.append(rule)

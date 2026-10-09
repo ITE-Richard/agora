@@ -57,6 +57,55 @@ class TestPrompt(unittest.TestCase):
         self.assertIn("新訊息", prompt)
 
 
+class TestConsensus(unittest.TestCase):
+    def test_agree_resets_when_someone_has_not_agreed(self):
+        agreed = cli.agree(set(), "claude", "好 【已達成共識】")
+        self.assertEqual(agreed, {"claude"})
+        self.assertEqual(cli.agree(agreed, "codex", "還有問題"), set())
+        self.assertEqual(cli.agree(agreed, "codex", "【已達成共識】"), {"claude", "codex"})
+
+    def test_auto_stops_only_when_every_party_agrees(self):
+        replies = ["【已達成共識】", "還有並發問題", "【已達成共識】", "【已達成共識】", "不該被呼叫"]
+        calls = []
+
+        def fake_invoke(ws, thread, state, party):
+            calls.append(party)
+            return replies[len(calls) - 1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            args = type("Args", (), {"thread": "t1", "rounds": 6, "order": None})()
+            with patch.dict(os.environ, {jobs.JOB_ENV: str(thread)}), patch.object(cli, "invoke", fake_invoke), \
+                    patch("sys.stdout", io.StringIO()):
+                os.environ.pop(cli.NESTED_ENV, None)
+                cli.cmd_auto(ws, args)
+        self.assertEqual(calls, ["claude", "codex", "claude", "codex"])
+
+
+class TestAntigravityMode(unittest.TestCase):
+    def run_call(self, work):
+        from agoralib import parties
+        seen = {}
+
+        def fake_run(cmd, workspace, stdin_text, timeout):
+            seen["cmd"] = cmd
+            return [{"status": "SUCCESS", "response": "ok", "conversation_id": "c1"}], ""
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(parties, "_run", fake_run):
+            parties.call_antigravity("hi", None, {}, work, Path(tmp), 60, Path(tmp))
+        return seen["cmd"]
+
+    def test_discussion_cannot_edit(self):
+        self.assertNotIn("--mode", self.run_call(work=False))
+
+    def test_work_accepts_edits(self):
+        cmd = self.run_call(work=True)
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "accept-edits")
+
+
 class TestCodexQuota(unittest.TestCase):
     def test_reads_latest_rate_limits_from_session_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,6 +162,20 @@ class TestInstall(unittest.TestCase):
             self.assertEqual(len(allow), len(set(allow)))
             self.assertEqual((Path(tmp) / ".gitignore").read_text(encoding="utf-8").count(".agora/"), 1)
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
+
+    def test_install_removes_old_antigravity_write_rules(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            ws = cli.Workspace(Path(tmp))
+            settings = Path(home) / ".gemini" / "antigravity-cli" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            keep = "write_file(D:/somewhere/else)"
+            settings.write_text(json.dumps({"permissions": {"allow": [
+                f"write_file({ws.root})", f"write_file({ws.root.as_posix()})", keep]}}), encoding="utf-8")
+            with patch.object(Path, "home", return_value=Path(home)):
+                cli.cmd_install(ws, None)
+            allow = json.loads(settings.read_text(encoding="utf-8"))["permissions"]["allow"]
+            self.assertFalse(any(r.startswith("write_file(") and r != keep for r in allow))
+            self.assertIn(keep, allow)
 
     def test_install_skips_disabled_parties(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:

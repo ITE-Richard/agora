@@ -29,7 +29,7 @@ $A send <id> --from claude --message "..."          # 預設依序請其他所�
 $A send <id> --from claude --to codex --file msg.md # 只請 Codex
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
-$A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言
+$A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
 $A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則依分配比例挑選）
 $A status <id> [--wait 900]                         # 分派狀態與最新進度
 $A recall <id>                                      # 請接手方在下一個檢查點暫停
@@ -102,7 +102,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | | 討論 | 接手工作 |
 |---|---|---|
 | Claude Code | 禁用 Edit/Write | `acceptEdits`；Bash 只允許 `agora.py quota/check` 與唯讀 git |
-| Antigravity | 依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） | 同左 |
+| Antigravity | 沒有寫檔權限 | `--mode accept-edits`（只能寫工作區）；指令依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） |
 | Codex | `-s read-only` | `-s workspace-write`（只能寫工作區） |
 
 - 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。

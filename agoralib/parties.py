@@ -2,7 +2,7 @@
 參與方：Claude Code、Antigravity、Codex 的非互動 CLI 呼叫，以及人類（使用者）。
 
 每個 AI 參與方提供 call(prompt, session_id, opts, work, workspace) -> (回覆, session_id, 附註)：
-- 討論模式（work=False）：唯讀，不改檔。
+- 討論模式（work=False）：唯讀，不改檔（Claude 禁用編輯工具、Codex read-only 沙箱、Antigravity 沒有寫檔權限）。
 - 工作模式（work=True）：可在工作區內改檔，終端指令受限。
 失敗時丟出 CallError，標記是否為額度用盡、是否因權限被拒（可接續原對話重試）。
 """
@@ -86,6 +86,10 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             overflow.write_text(prompt, encoding="utf-8")
             prompt = f"這則訊息較長，完整內容在 {overflow}，請先讀取該檔再照內容回覆。"
         cmd = [find_agy(), "-p", prompt, "--output-format", "json", "--print-timeout", f"{timeout}s"]
+        if work:
+            # 只有接手工作時開放改檔：accept-edits 允許寫工作區內的檔案，工作區外仍會被拒絕。
+            # 不在全域權限加 write_file，否則同一個工作區的討論也能改檔。
+            cmd += ["--mode", "accept-edits"]
         if session_id:
             cmd += ["--conversation", session_id]
         if opts.get("model"):
