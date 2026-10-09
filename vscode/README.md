@@ -25,6 +25,7 @@ code --install-extension agora-0.1.0.vsix
 ```
 
 Agora 程式搬家時，重新打包或在設定 `agora.root` 指定新位置。
+找不到 `agora.py` 時，擴充套件會改用 PATH 上的 `agora` 指令（`pip install -e <Agora 資料夾>`）。
 
 ## 設定
 

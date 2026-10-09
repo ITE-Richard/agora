@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agora-cli"
+dynamic = ["version"]
+description = "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論、分派工作、監控額度"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+agora = "agoralib.cli:main"
+
+[tool.setuptools]
+packages = ["agoralib"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agoralib.__version__" }

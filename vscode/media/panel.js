@@ -146,7 +146,7 @@
     if (!state.workspace) {
       children.push(el("p", { class: "muted" }, "請先開啟一個資料夾。"));
     } else if (!state.agoraFound) {
-      children.push(el("div", { class: "notice" }, "找不到 agora.py。請在設定中指定 agora.root。",
+      children.push(el("div", { class: "notice" }, "找不到 Agora。請執行 pip install -e <Agora 資料夾>，或在設定中指定 agora.root。",
         el("button", { onclick: () => vscode.postMessage({ type: "settings" }) }, "開啟設定")));
     } else {
       if (!state.installed) {

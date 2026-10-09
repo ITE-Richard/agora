@@ -417,6 +417,19 @@ class TestInstall(unittest.TestCase):
             self.assertIn("已被 git 追蹤", out.getvalue())
             self.assertIn(".claude/skills/agora/SKILL.md", out.getvalue())
 
+    def test_install_uses_agora_command_when_installed(self):
+        from agoralib import parties
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            with patch.object(Path, "home", return_value=Path(home)), patch.object(parties, "_CMD", "agora"):
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+            skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("T=$(agora new", skill)
+            self.assertNotIn("agora.py new", skill)
+            allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
+                               .read_text(encoding="utf-8"))["permissions"]["allow"]
+            self.assertIn("command(agora quota)", allow)
+            self.assertIn(f"command({parties.LEGACY_CMD} quota)", allow)   # 舊指令保留相容
+
     def test_exclude_in_subdirectory_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp)
@@ -721,6 +734,14 @@ class TestCliResolvers(unittest.TestCase):
     def test_find_claude_env_override(self):
         with patch.dict(os.environ, {"CLAUDE_PATH": "/custom/claude"}):
             self.assertEqual(quota.find_claude(), "/custom/claude")
+
+    def test_agora_cmd_falls_back_to_script_path(self):
+        from agoralib import parties
+        with patch.object(parties, "_CMD", None), patch.object(parties.shutil, "which", return_value=None):
+            self.assertEqual(parties.agora_cmd(), parties.LEGACY_CMD)
+        with patch.object(parties, "_CMD", None), \
+                patch.object(parties.shutil, "which", return_value=str(Path(tempfile.gettempdir()) / "agora.exe")):
+            self.assertEqual(parties.agora_cmd(), parties.LEGACY_CMD)   # 不在目前 Python 的 Scripts 底下
 
     def test_find_agy_env_override(self):
         from agoralib import parties

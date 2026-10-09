@@ -33,6 +33,28 @@ function agoraRoot() {
   return candidates.find((c) => c && fs.existsSync(path.join(c, "agora.py")));
 }
 
+function findOnPath(name) {
+  const exts = process.platform === "win32" ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";") : [""];
+  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+    for (const ext of exts) {
+      const file = path.join(dir, name + ext);
+      if (fs.existsSync(file)) return file;
+    }
+  }
+  return undefined;
+}
+
+/** 執行 Agora 的方式：agora.root（或打包時記錄的位置）的 agora.py，找不到時用 PATH 上的 agora 指令（pip install -e） */
+function agoraCommand() {
+  const root = agoraRoot();
+  if (root) {
+    const python = vscode.workspace.getConfiguration("agora").get("pythonPath") || "python";
+    return { cmd: python, prefix: [path.join(root, "agora.py")] };
+  }
+  const exe = findOnPath("agora");
+  return exe ? { cmd: exe, prefix: [] } : undefined;
+}
+
 function workspaceRoot() {
   const folders = vscode.workspace.workspaceFolders;
   return folders && folders.length ? folders[0].uri.fsPath : undefined;
@@ -50,21 +72,21 @@ function killTree(proc) {
 
 /** 執行 agora.py；失敗時丟出 AgoraError（訊息為 agora.py 印在 stderr 的最後一段） */
 function runAgora(args, { input, token, onProgress, log = true } = {}) {
-  const root = agoraRoot();
+  const agora = agoraCommand();
   const ws = workspaceRoot();
-  if (!root) {
-    return Promise.reject(new AgoraError("找不到 agora.py，請在設定 agora.root 指定 Agora 程式所在的資料夾。"));
+  if (!agora) {
+    return Promise.reject(new AgoraError("找不到 Agora：請執行 pip install -e <Agora 資料夾>，或在設定 agora.root 指定 Agora 程式所在的資料夾。"));
   }
   if (!ws) {
     return Promise.reject(new AgoraError("請先開啟一個資料夾。"));
   }
-  const python = vscode.workspace.getConfiguration("agora").get("pythonPath") || "python";
-  const fullArgs = [path.join(root, "agora.py"), "--workspace", ws, ...args];
+  const cmd = agora.cmd;
+  const fullArgs = [...agora.prefix, "--workspace", ws, ...args];
   if (log) {
     output.appendLine(`$ agora ${args.join(" ")}`);
   }
   return new Promise((resolve, reject) => {
-    const proc = cp.spawn(python, fullArgs, {
+    const proc = cp.spawn(cmd, fullArgs, {
       cwd: ws,
       env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
       windowsHide: true,
@@ -83,7 +105,7 @@ function runAgora(args, { input, token, onProgress, log = true } = {}) {
       const line = d.trim().split("\n").pop();
       if (onProgress && line) onProgress(line);
     });
-    proc.on("error", (e) => reject(new AgoraError(`無法執行 ${python}：${e.message}`)));
+    proc.on("error", (e) => reject(new AgoraError(`無法執行 ${cmd}：${e.message}`)));
     proc.on("close", (code) => {
       if (code === 0) {
         resolve(stdout);
@@ -437,7 +459,7 @@ class Model {
   snapshot() {
     return {
       workspace: workspaceRoot(),
-      agoraFound: !!agoraRoot(),
+      agoraFound: !!agoraCommand(),
       installed: this.installed(),
       parties: this.parties,
       work: this.work,

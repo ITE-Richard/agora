@@ -19,7 +19,8 @@ from typing import Callable, Dict, Optional, Tuple
 from agoralib import quota
 
 AGORA_ROOT = Path(__file__).resolve().parents[1]
-AGORA_CMD = f"python {AGORA_ROOT.as_posix()}/agora.py"   # 給接手方執行的固定指令（權限採完整比對）
+LEGACY_CMD = f"python {AGORA_ROOT.as_posix()}/agora.py"
+DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
 QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|429|resource_exhausted|credits", re.I)
 
@@ -28,6 +29,44 @@ AI_PARTIES = ("claude", "antigravity", "codex")
 NAMES = {"claude": "Claude Code", "antigravity": "Antigravity", "codex": "Codex",
          HUMAN: os.getenv("AGORA_HUMAN_NAME", "Richard")}
 ALIASES = {"richard": HUMAN, "user": HUMAN, "agy": "antigravity", "gemini": "antigravity", "openai": "codex"}
+
+
+def _installed_here(exe: Path) -> bool:
+    """exe 是目前這個 Python 以 pip install -e 安裝、指向這份程式的 agora 指令"""
+    import sysconfig
+    from importlib import metadata
+    from urllib.parse import unquote, urlparse
+    scripts = {Path(p).resolve() for p in (sysconfig.get_path("scripts"),
+                                            sysconfig.get_path("scripts", f"{os.name}_user")) if p}
+    if exe.resolve().parent not in scripts:
+        return False
+    # 從 repo 目錄執行時，setuptools 留在 repo 的 egg-info 也會被找到，所以逐一檢查有安裝紀錄的那份
+    for dist in metadata.distributions():
+        if (dist.metadata["Name"] or "").lower() != DIST_NAME:
+            continue
+        try:
+            url = urlparse(json.loads(dist.read_text("direct_url.json") or "{}").get("url", ""))
+        except json.JSONDecodeError:
+            continue
+        path = unquote(url.path)
+        if re.match(r"^/[A-Za-z]:", path):   # file:///D:/github/agora
+            path = path[1:]
+        if url.scheme == "file" and Path(path).resolve() == AGORA_ROOT:
+            return True
+    return False
+
+
+_CMD = None
+
+
+def agora_cmd() -> str:
+    """給 AI 執行的 Agora 指令（Antigravity 的權限是完整比對，所以要固定）：
+    已用 pip install -e 安裝、指向這份程式時為 agora，否則為 python <路徑>/agora.py"""
+    global _CMD
+    if _CMD is None:
+        exe = shutil.which("agora")
+        _CMD = "agora" if exe and _installed_here(Path(exe)) else LEGACY_CMD
+    return _CMD
 
 
 def canonical(name: str) -> str:
@@ -121,7 +160,7 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
     if work:
         # 可改檔；Bash 只開放 Agora 的固定指令與唯讀 git，其餘在非互動模式下會被拒絕
         cmd += ["--permission-mode", "acceptEdits",
-                "--allowedTools", f"Bash({AGORA_CMD} quota*)", f"Bash({AGORA_CMD} check*)",
+                "--allowedTools", f"Bash({agora_cmd()} quota*)", f"Bash({agora_cmd()} check*)",
                 "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
                 "--disallowedTools", "Read(./.env)", "Edit(./.env)"]
     else:

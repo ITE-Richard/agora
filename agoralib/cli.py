@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
-from agoralib.parties import (AGORA_CMD, AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
-                              NESTED_ENV, CallError, canonical)
+from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
+                              NESTED_ENV, CallError, agora_cmd, canonical)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -670,7 +670,7 @@ def cmd_assign(ws: Workspace, args):
     if baseline.get("error"):
         print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
     print(f"進度：{paths['progress']}")
-    print(f"查詢：python {entry.as_posix()} status {thread.name} --wait 900")
+    print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
 
 
 def cmd_changes(ws: Workspace, args):
@@ -736,7 +736,7 @@ def cmd_work(ws: Workspace, args):
         relay = update_relay(thread, status="running", waiting_until=None)
         fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root,
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
-                   agora=AGORA_CMD)
+                   agora=agora_cmd())
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
             if relay["rounds"] == 0:
@@ -1079,11 +1079,16 @@ def _merge_json(path: Path, update) -> dict:
     return data
 
 
+SKILL_ROOT = "D:/github/agora"   # skills 範本裡的 Agora 位置，install 時換成實際位置或 agora 指令
+
+
 def cmd_install(ws: Workspace, args):
     """把 Agora 裝進工作區：啟用中各 AI 的使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設設定"""
     import shutil
     root = AGORA_ROOT_DIR
     hook = f"python {(root / 'agoralib' / 'quota_hook.py').as_posix()}"
+    legacy = f"python {root.as_posix()}/agora.py"
+    cmd = agora_cmd() if agora_cmd() == "agora" else legacy   # skills 與權限裡給 AI 用的指令
     done = []
 
     config_file = config.config_path(ws.root)
@@ -1099,7 +1104,7 @@ def cmd_install(ws: Workspace, args):
             target = dest / skill
             target.mkdir(parents=True, exist_ok=True)
             content = (root / "skills" / agent / skill / "SKILL.md").read_text(encoding="utf-8")
-            content = content.replace("D:/github/agora", root.as_posix())
+            content = content.replace(f"python {SKILL_ROOT}/agora.py", cmd).replace(SKILL_ROOT, root.as_posix())
             (target / "SKILL.md").write_text(content, encoding="utf-8")
         done.append(f"{agent} skills → {dest}")
 
@@ -1109,7 +1114,7 @@ def cmd_install(ws: Workspace, args):
         agents_md = ws.root / "AGENTS.md"
         created_agents_md = not agents_md.exists()
         section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
-        section = section.replace("D:/github/agora", root.as_posix())
+        section = section.replace(f"python {SKILL_ROOT}/agora.py", cmd).replace(SKILL_ROOT, root.as_posix())
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
         text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
             if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
@@ -1137,7 +1142,8 @@ def cmd_install(ws: Workspace, args):
         allow = data.setdefault("permissions", {}).setdefault("allow", [])
         old = {f"write_file({ws.root})", f"write_file({ws.root.as_posix()})"}
         allow[:] = [rule for rule in allow if rule not in old]
-        for rule in (f"command({AGORA_CMD} quota)", f"command({AGORA_CMD} check)", "command(git status)",
+        cmds = list(dict.fromkeys([cmd, legacy]))   # 舊的路徑指令也保留，已裝過的 skills 仍可用
+        for rule in (*[f"command({c} {sub})" for c in cmds for sub in ("quota", "check")], "command(git status)",
                      "command(git diff)", "command(git log)",
                      f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:

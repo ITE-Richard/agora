@@ -15,10 +15,21 @@
 
 工作區預設為目前資料夾的 git 根目錄，也可用 `--workspace` 指定。
 
+## 安裝
+
+```bash
+pip install -e D:/github/agora     # 建議：提供固定的 agora 指令（可編輯安裝，直接使用這份程式）
+cd <專案資料夾> && agora install    # 安裝 skills、hook、權限與 git 排除
+```
+
+- 用 `pip install -e` 安裝後，skills、接手方的指令權限與工作提示都改用固定的 `agora` 指令，Agora 搬家或更新時不必替每個專案重新 install（額度 hook 仍記錄路徑，搬家後要重新 install）。
+- 沒有安裝時照樣可以用 `python <Agora 資料夾>/agora.py`；Antigravity 的權限會同時保留兩種寫法，已裝過的 skills 不受影響。
+- 只有當 PATH 上的 `agora` 屬於目前這個 Python、而且指向這份程式時才會使用它，否則退回路徑寫法。
+
 ## 指令
 
 ```bash
-A="python D:/github/agora/agora.py"
+A=agora    # 或 A="python D:/github/agora/agora.py"
 
 $A parties                                          # 此專案參與的 AI 與模型
 $A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
@@ -138,9 +149,11 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 ```
 agora.py               進入點
+pyproject.toml         pip 套件設定（agora 指令）
 agoralib/cli.py        討論、分派、狀態、驗證
 agoralib/config.py     工作區設定（參與的 AI、模型、推理強度、分配比例）
 agoralib/shares.py     依分配比例挑選接手方、記錄接手輪數
+agoralib/snapshot.py   分派基準快照與分派期間的變更
 agoralib/prune.py      清理不再需要的討論串與對話紀錄
 agoralib/jobs.py       背景執行（關閉視窗不中斷）、進度轉送
 agoralib/models.py     各 AI 可選的模型
