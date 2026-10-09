@@ -77,6 +77,12 @@
         "icon": "$(debug-continue)"
       },
       {
+        "command": "agora.summarize",
+        "title": "產出討論總結",
+        "category": "Agora",
+        "icon": "$(checklist)"
+      },
+      {
         "command": "agora.assign",
         "title": "分派工作",
         "category": "Agora",
@@ -86,6 +92,12 @@
         "command": "agora.status",
         "title": "查看分派進度",
         "category": "Agora"
+      },
+      {
+        "command": "agora.changes",
+        "title": "檢視分派期間的變更",
+        "category": "Agora",
+        "icon": "$(diff)"
       },
       {
         "command": "agora.recall",
@@ -170,6 +182,11 @@
           "group": "1_talk@2"
         },
         {
+          "command": "agora.summarize",
+          "when": "view == agora.threads && viewItem =~ /^thread/",
+          "group": "1_talk@4"
+        },
+        {
           "command": "agora.assign",
           "when": "view == agora.threads && viewItem =~ /^thread/",
           "group": "2_work@1"
@@ -183,6 +200,11 @@
           "command": "agora.recall",
           "when": "view == agora.threads && viewItem =~ /relay-active/",
           "group": "2_work@3"
+        },
+        {
+          "command": "agora.changes",
+          "when": "view == agora.threads && viewItem =~ /relay/",
+          "group": "2_work@4"
         },
         {
           "command": "agora.keep",
@@ -265,6 +287,7 @@
   },
   "scripts": {
     "vscode:prepublish": "node scripts/stamp-root.js",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license",
+    "test": "node --test \"test/*.test.js\""
   }
 }

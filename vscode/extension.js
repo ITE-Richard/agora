@@ -5,6 +5,7 @@ const vscode = require("vscode");
 const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const editorCtx = require("./context");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const NAMES = { claude: "Claude Code", antigravity: "Antigravity", codex: "Codex", human: "我" };
@@ -103,7 +104,7 @@ async function runJson(args) {
 }
 
 /** 需要等 AI 回覆的動作：顯示可取消的進度通知 */
-const BACKGROUND_COMMANDS = ["send", "reply", "auto"];
+const BACKGROUND_COMMANDS = ["send", "reply", "auto", "summarize"];
 
 /** 討論在 agora.py 的背景程序執行：取消只是停止等待，討論會繼續，完成時另有通知 */
 async function runLong(title, args, input) {
@@ -250,10 +251,12 @@ function notifyFinished(item) {
     warn = relay.status !== "done";
     text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}。`;
   }
-  const shown = warn ? vscode.window.showWarningMessage(`Agora：${text}`, "開啟逐字稿")
-    : vscode.window.showInformationMessage(`Agora：${text}`, "開啟逐字稿");
+  const buttons = item.type === "relay" ? ["開啟逐字稿", "檢視變更"] : ["開啟逐字稿"];
+  const shown = warn ? vscode.window.showWarningMessage(`Agora：${text}`, ...buttons)
+    : vscode.window.showInformationMessage(`Agora：${text}`, ...buttons);
   shown.then((choice) => {
-    if (choice) openTranscript(thread);
+    if (choice === "檢視變更") vscode.commands.executeCommand("agora.changes", thread);
+    else if (choice) openTranscript(thread);
   });
 }
 
@@ -276,27 +279,90 @@ async function openTranscript(thread) {
   await vscode.commands.executeCommand("markdown.showPreview", uri);
 }
 
-/** 輸入訊息：可以直接輸入一行，或使用目前編輯器的選取內容／整份文件 */
+/** 目前編輯器的上下文：選取範圍（沒有選取時為整份檔案）的位置、內容與診斷 */
+function editorContext(editor, includeCode) {
+  const doc = editor.document;
+  const sel = editor.selection;
+  let range = null;
+  let code = null;
+  if (!sel.isEmpty) {
+    // 選到下一行開頭（游標在第 0 欄）時，不把那一行算進範圍
+    const end = sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line - 1 : sel.end.line;
+    range = { start: sel.start.line + 1, end: end + 1 };
+    if (includeCode) code = doc.getText(sel);
+  } else if (includeCode) {
+    code = doc.getText();
+  }
+  const relPath = doc.isUntitled ? "（未命名檔案）" : vscode.workspace.asRelativePath(doc.uri, false).replace(/\\/g, "/");
+  const diagnostics = vscode.languages.getDiagnostics(doc.uri).map((d) => ({
+    line: d.range.start.line + 1, endLine: d.range.end.line + 1, column: d.range.start.character + 1,
+    severity: d.severity, source: d.source, message: String(d.message).split("\n")[0],
+  }));
+  return editorCtx.formatContext({
+    relPath, languageId: doc.languageId, version: doc.version, dirty: doc.isDirty, range, code,
+    lineCount: doc.lineCount, diagnostics,
+  });
+}
+
+/** 輸入訊息；有開啟的編輯器時，可附上它的上下文（位置、選取內容或整份檔案、診斷） */
 async function askMessage(prompt) {
   const editor = vscode.window.activeTextEditor;
-  if (editor && !editor.document.uri.fsPath.endsWith("transcript.md")) {
-    const selection = editor.document.getText(editor.selection);
-    const name = path.basename(editor.document.fileName);
+  let attached = "";
+  if (editor && !editor.document.uri.fsPath.endsWith("transcript.md") && editor.document.uri.scheme !== "agora-base") {
+    const doc = editor.document;
+    const name = path.basename(doc.fileName);
+    const sel = editor.selection;
+    const scope = sel.isEmpty ? "整份檔案" : `第 ${sel.start.line + 1}–${sel.end.line + 1} 行`;
     const choice = await vscode.window.showQuickPick(
       [
-        { label: "$(edit) 輸入訊息", value: "type" },
-        selection.trim()
-          ? { label: "$(selection) 使用編輯器選取的內容", description: name, value: "selection" }
-          : { label: "$(file) 使用目前編輯器的整份內容", description: name, value: "document" },
+        { label: `$(file-code) 輸入訊息，並附上 ${name} 的上下文`, description: `${scope}、路徑、行號與診斷`, value: "context" },
+        { label: "$(edit) 只輸入訊息", value: "plain" },
       ],
       { placeHolder: prompt },
     );
     if (!choice) return undefined;
-    if (choice.value === "selection") return selection;
-    if (choice.value === "document") return editor.document.getText();
+    if (choice.value === "context") {
+      let includeCode = true;
+      if (sel.isEmpty && editorCtx.tooLarge(doc.lineCount, doc.getText().length)) {
+        const go = await vscode.window.showWarningMessage(
+          `${name} 有 ${doc.lineCount} 行，太大不適合整份附上。請先選取要討論的範圍，或只附路徑與診斷。`,
+          "只附路徑與診斷");
+        if (!go) return undefined;
+        includeCode = false;
+      }
+      attached = editorContext(editor, includeCode);
+    }
   }
-  const text = await vscode.window.showInputBox({ prompt, ignoreFocusOut: true });
-  return text && text.trim() ? text : undefined;
+  const text = await vscode.window.showInputBox({
+    prompt: attached ? `${prompt}（已附上編輯器上下文，可留空）` : prompt, ignoreFocusOut: true,
+  });
+  if (text === undefined) return undefined;
+  const message = [text.trim(), attached].filter(Boolean).join("\n\n");
+  return message || undefined;
+}
+
+// ───────────────────────── 分派期間的變更 ─────────────────────────
+
+const STATUS_LABELS = { A: "新增", M: "修改", D: "刪除", T: "類型變更" };
+
+/** agora-base:/<路徑>?sha=<基準>&path=<路徑>：分派基準裡的檔案內容；empty=1 表示該側沒有這個檔案 */
+class BaselineProvider {
+  provideTextDocumentContent(uri) {
+    const q = new URLSearchParams(uri.query);
+    if (q.get("empty")) return "";
+    const ws = workspaceRoot();
+    return new Promise((resolve, reject) => {
+      cp.execFile("git", ["show", `${q.get("sha")}:${q.get("path")}`], { cwd: ws, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+        (err, stdout, stderr) => (err
+          ? reject(new Error(`無法讀取分派基準中的 ${q.get("path")}：${(stderr || err.message).trim()}`))
+          : resolve(stdout)));
+    });
+  }
+}
+
+function baselineUri(sha, file, empty) {
+  const query = new URLSearchParams({ sha, path: file, ...(empty ? { empty: "1" } : {}) }).toString();
+  return vscode.Uri.from({ scheme: "agora-base", path: `/${file}`, query });
 }
 
 // ───────────────────────── 參與方、模型、額度 ─────────────────────────
@@ -336,6 +402,7 @@ class Model {
     this.parties = data.parties;
     this.work = data.work || {};
     this.shareDays = data.share_days || 7;
+    this.summarizer = data.summarizer || null;
   }
 
   async loadCatalog(refresh = false) {
@@ -634,6 +701,23 @@ function activate(context) {
   command("agora.assign", async (arg) => {
     const thread = await pickThread(arg);
     if (!thread) return;
+    const summary = thread.state.summary;
+    let fromSummary = false;
+    if (summary) {
+      const source = await vscode.window.showQuickPick(
+        [
+          { label: "$(checklist) 使用總結的工作單", description: `${NAMES[summary.by] || summary.by} · ${summary.time}`, value: true },
+          { label: "$(edit) 自己輸入工作單", value: false },
+        ],
+        { placeHolder: "工作單來源" },
+      );
+      if (!source) return;
+      fromSummary = source.value;
+      if (fromSummary && summary.error) {
+        vscode.window.showErrorMessage(`Agora：無法依總結分派：${summary.error}。請重新總結或自己輸入工作單。`);
+        return;
+      }
+    }
     const enabled = model.enabled();
     const worker = await vscode.window.showQuickPick(
       [
@@ -645,13 +729,63 @@ function activate(context) {
       { placeHolder: "把工作交給誰？接手方會在背景執行，只能修改工作區內的檔案、不能 commit" },
     );
     if (!worker) return;
-    const text = await askMessage("工作單：範圍、不能碰的檔案、驗收方式");
-    if (!text) return;
-    const out = await runAgora(["assign", thread.id, "--from", "human", ...(worker.to ? ["--to", worker.to] : [])],
-      { input: text });
+    const args = ["assign", thread.id, "--from", "human", ...(worker.to ? ["--to", worker.to] : [])];
+    let out;
+    if (fromSummary) {
+      try {
+        out = await runAgora([...args, "--from-summary"]);
+      } catch (e) {
+        if (!(e instanceof AgoraError) || !e.message.includes("總結可能已過期")) throw e;
+        const ok = await vscode.window.showWarningMessage(e.message.replace(/確認仍要.*$/, "").trim(), { modal: true }, "仍要分派");
+        if (!ok) return;
+        out = await runAgora([...args, "--from-summary", "--yes"]);
+      }
+    } else {
+      const text = await askMessage("工作單：範圍、不能碰的檔案、驗收方式");
+      if (!text) return;
+      out = await runAgora(args, { input: text });
+    }
     const lines = out.trim().split("\n").filter((l) => !l.startsWith("進度：") && !l.startsWith("查詢："));
     vscode.window.showInformationMessage(lines.join(" "));
     threads.refresh();
+  });
+
+  command("agora.summarize", async (arg) => {
+    const thread = await pickThread(arg);
+    if (!thread) return;
+    await model.loadParties();
+    const def = model.summarizer;
+    const parties = [...model.enabled()].sort((a, b) => (b === def) - (a === def));
+    const picked = await vscode.window.showQuickPick(
+      parties.map((p) => ({
+        label: NAMES[p], party: p,
+        description: [p === def ? "預設總結方" : "", model.quota ? quotaText(model.quota[p]) : ""].filter(Boolean).join(" · "),
+      })),
+      { placeHolder: "由誰總結？會開新的對話讀完整逐字稿，產出共識、取捨、異議與工作單" },
+    );
+    if (!picked) return;
+    await runLong(`等待 ${picked.label} 產出總結`, ["summarize", thread.id, "--by", picked.party]);
+    const file = path.join(thread.dir, "summary.md");
+    if (fs.existsSync(file)) await vscode.commands.executeCommand("markdown.showPreview", vscode.Uri.file(file));
+  });
+
+  command("agora.changes", async (arg) => {
+    const thread = await pickThread(arg);
+    if (!thread) return;
+    const data = JSON.parse(await runAgora(["changes", thread.id, "--json"], { log: false }));
+    if (!data.files.length) {
+      vscode.window.showInformationMessage(`「${thread.state.topic}」分派期間沒有檔案變更。`);
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      data.files.map((f) => ({ label: f.path, description: STATUS_LABELS[f.status] || f.status, file: f })),
+      { placeHolder: `分派期間的變更（${data.since} 起，期間任何人的修改都會列出）：選一個檔案檢視差異` },
+    );
+    if (!picked) return;
+    const f = picked.file;
+    const left = baselineUri(data.baseline, f.path, f.status === "A");
+    const right = f.status === "D" ? baselineUri(data.baseline, f.path, true) : vscode.Uri.file(path.join(workspaceRoot(), f.path));
+    await vscode.commands.executeCommand("vscode.diff", left, right, `${f.path}（分派基準 ↔ 目前）`);
   });
 
   command("agora.status", async (arg) => {
@@ -774,6 +908,7 @@ function activate(context) {
     statusBar,
     vscode.window.registerWebviewViewProvider("agora.parties", panel),
     vscode.window.registerTreeDataProvider("agora.threads", threads),
+    vscode.workspace.registerTextDocumentContentProvider("agora-base", new BaselineProvider()),
   );
 
   // 討論串與設定檔變動時自動更新（AI 回覆、背景接手、從終端機改設定）
