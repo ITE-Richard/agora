@@ -31,6 +31,8 @@ $A send <id> --from human --message "..."           # 使用者插話（只記�
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
 $A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則依分配比例挑選）
+$A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
+$A assign <id> --from human --from-summary [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900]                         # 分派狀態與最新進度
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A recall <id>                                      # 請接手方在下一個檢查點暫停
@@ -46,6 +48,13 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 ```
 
 `<id>` 可以用前綴或 `latest`。沒給 `--message` / `--file` 時讀 stdin。
+
+## 總結與依總結分派
+
+- `summarize` 請指定的一方開**新的對話**、讀**完整逐字稿**（不只未讀訊息），依固定格式輸出：共識、採納與放棄的意見、保留的異議、`## 工作單`（範圍、步驟、驗收條件）。
+  結果存成討論串的 `summary.md`，也記進逐字稿。總結方由使用者指定；它額度不足時會提示改用誰，不自動換人。
+- `assign --from-summary` 只取 `## 工作單` 段落當工作單；找不到或是空的就拒絕分派。
+- 總結時記下訊息數與工作單提到的檔案雜湊；之後又有新訊息或檔案變了，會提示總結可能已過期，要加 `--yes` 才分派。這只用來偵測變動，不代表誰改了什麼。
 
 ## 參與的 AI 與模型
 
@@ -122,7 +131,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | `AGORA_QUOTA_THRESHOLD` | 5（%） |
 | `AGORA_AGY_POOL` | gemini（Antigravity 內 Gemini 與 Claude 模型是不同額度池） |
 
-工作區的 `.agora/config.json` 可設定 `check` 指令，例如 `{"check": ["python", "-m", "unittest", "discover", "-s", "tests"]}`；參與的 AI 與模型見上方。
+工作區的 `.agora/config.json` 可設定 `summarizer`（`summarize` 沒給 `--by` 時的總結方，例如 `"claude"`）與 `check` 指令，例如 `{"check": ["python", "-m", "unittest", "discover", "-s", "tests"]}`；參與的 AI 與模型見上方。
 
 ## 專案結構
 

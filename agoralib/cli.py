@@ -75,6 +75,33 @@ WORK_PREAMBLE = """\
 以下是 {owner} 的工作單：
 """
 
+SUMMARY_PROMPT = """\
+【Agora 討論總結】
+你是 {me}。請閱讀下面「{topic}」的完整討論逐字稿（共 {count} 則），整理成總結。
+這是純整理：不要建立、修改、刪除任何檔案，也不要執行會改變狀態的指令；需要查證時用讀檔與搜尋工具。
+工作區：{workspace}
+
+請嚴格依照以下格式輸出，標題文字不要改；沒有內容的段落寫「無」：
+
+## 共識
+## 採納的意見
+（誰提出、為什麼採納）
+## 放棄的意見
+（誰提出、為什麼放棄）
+## 保留的異議
+（尚未解決的分歧與各方理由）
+## 工作單
+### 範圍
+（要修改的檔案，用工作區相對路徑，例如 `src/app.py`；以及不能碰的檔案）
+### 步驟
+### 驗收條件
+（可以執行的驗證方式，例如要通過的測試）
+
+工作單要能直接交給另一個 AI 執行；討論沒有結論、不適合分派時，「## 工作單」底下只寫「無」。
+
+以下是完整逐字稿：
+"""
+
 CONTINUE_PROMPT = """\
 【Agora 工作分派・繼續】
 請先讀 {progress} 與 {control}，從上次停下的地方繼續。界線與工作方式和第一輪相同：
@@ -427,6 +454,128 @@ def cmd_auto(ws: Workspace, args):
             idx = (idx + 1) % len(order)
 
 
+# ───────────────────────── 總結 ─────────────────────────
+
+WORK_ORDER_HEADING = re.compile(r"^##[ \t]*工作單[ \t]*$", re.M)
+PATH_TOKEN = re.compile(r"(?<![\w/.\\-])((?:[\w.-]+[/\\])*[\w-][\w.-]*\.[A-Za-z0-9]+)")
+
+
+def work_order(summary: str) -> str:
+    """總結的「## 工作單」段落（到下一個 ## 標題為止）；找不到或是空的就丟出 ValueError"""
+    m = WORK_ORDER_HEADING.search(summary)
+    if not m:
+        raise ValueError("總結裡找不到「## 工作單」段落")
+    rest = summary[m.end():]
+    end = re.search(r"^##(?!#)", rest, re.M)
+    body = (rest[:end.start()] if end else rest).strip()
+    if not body or body.strip("（）() ") == "無":
+        raise ValueError("工作單是空的（討論沒有可以分派的結論）")
+    return body
+
+
+def file_hash(path: Path) -> Optional[str]:
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def referenced_files(root: Path, text: str) -> dict:
+    """工作單提到的工作區檔案 → 內容雜湊（不存在的檔案記為 None），用來偵測總結是否過期"""
+    out, top = {}, root.resolve()
+    for token in PATH_TOKEN.findall(text):
+        rel = token.replace("\\", "/")
+        rel = rel[2:] if rel.startswith("./") else rel
+        path = (top / rel).resolve()
+        # 存在的檔案，或含目錄的路徑（之後才要建立的檔案）；版本號、網址片段之類的不算
+        if top in path.parents and (path.is_file() or ("/" in rel and not path.exists())):
+            out[rel] = file_hash(path)
+    return out
+
+
+def stale_reasons(root: Path, state: dict) -> List[str]:
+    info = state.get("summary") or {}
+    reasons = []
+    newer = len(state["messages"]) - info.get("messages", 0)
+    if newer > 0:
+        reasons.append(f"總結後又有 {newer} 則新訊息")
+    changed = [p for p, h in (info.get("files") or {}).items() if file_hash(root / p) != h]
+    if changed:
+        reasons.append("工作單涉及的檔案已變動：" + "、".join(changed[:5]) + ("…" if len(changed) > 5 else ""))
+    return reasons
+
+
+def suggest_other(ws: Workspace, party: str) -> Optional[str]:
+    others = [p for p in ws.enabled() if p != party and not quota.low(quota.usage(p))]
+    return max(others, key=lambda p: (quota.usage(p) or {}).get("remaining_pct", 0)) if others else None
+
+
+def cmd_summarize(ws: Workspace, args):
+    """請指定的一方用新的對話讀完整逐字稿，產出共識、取捨、異議與工作單（存成 summary.md）"""
+    guard_nested()
+    thread = ws.resolve_thread(args.thread)
+    by = args.by or ws.config().get("summarizer")
+    if not by:
+        sys.exit("請用 --by 指定總結方（或在 .agora/config.json 設定 \"summarizer\"）。")
+    party = require_enabled(ws, canonical(by))
+    usage = quota.usage(party)
+    if quota.low(usage):
+        other = suggest_other(ws, party)
+        sys.exit(f"{NAMES[party]} 額度不足（剩 {usage.get('remaining_pct', 0):.0f}%），"
+                 + (f"可改用 --by {other}。" if other else "其他 AI 的額度也不足。"))
+    in_background(ws, thread, "summarize", ["summarize", thread.name, "--by", party])
+    with thread_lock(thread):
+        state = load_state(thread)
+        messages = state["messages"]
+        if not messages:
+            sys.exit("此討論串還沒有任何發言。")
+        transcript = "\n\n".join(f"【{NAMES.get(m['speaker'], m['speaker'])} · {m['time']}】\n{m['text']}"
+                                 for m in messages)
+        prompt = SUMMARY_PROMPT.format(me=NAMES[party], topic=state["topic"], count=len(messages),
+                                       workspace=ws.root) + "\n" + transcript
+        opts = call_opts(ws, state, party)
+        print(f"…等待 {NAMES[party]} 產出總結", file=sys.stderr, flush=True)
+        jobs.set_current(party)
+        try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿
+            reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread)
+        except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
+            remember_session(state, party, getattr(e, "session_id", None))
+            save_state(thread, state)
+            sys.exit(f"{NAMES[party]} 產出總結失敗：{e}")
+        remember_session(state, party, session_id)
+        try:
+            order, error = work_order(reply), None
+        except ValueError as e:
+            order, error = "", str(e)
+        add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {meta}")
+        state["summary"] = {"by": party, "time": now_str(), "messages": len(state["messages"]),
+                            "files": referenced_files(ws.root, order), "error": error}
+        save_state(thread, state)
+        (thread / "summary.md").write_text(
+            f"# 總結：{state['topic']}\n\n- 總結方：{NAMES[party]}\n- 時間：{state['summary']['time']}\n"
+            f"- 涵蓋 {len(messages)} 則訊息\n\n{reply.strip()}\n", encoding="utf-8")
+    print(reply)
+    if error:
+        print(f"\n⚠️ {error}，無法依此總結分派。", file=sys.stderr)
+
+
+def summary_handoff(ws: Workspace, thread: Path, state: dict, confirmed: bool) -> str:
+    """assign --from-summary：取總結的工作單；解析失敗就拒絕，過期時要 --yes 確認"""
+    info = state.get("summary")
+    if not info or not (thread / "summary.md").exists():
+        sys.exit("此討論串還沒有總結，請先執行 summarize。")
+    try:
+        order = work_order((thread / "summary.md").read_text(encoding="utf-8"))
+    except ValueError as e:
+        sys.exit(f"無法依總結分派：{e}。")
+    reasons = stale_reasons(ws.root, state)
+    if reasons and not confirmed:
+        sys.exit("總結可能已過期：" + "；".join(reasons) + "。確認仍要依此總結分派，請加 --yes。")
+    return f"（依 {NAMES.get(info['by'], info['by'])} 在 {info['time']} 的討論總結）\n\n{order}"
+
+
 # ───────────────────────── 分派工作 ─────────────────────────
 
 def relay_paths(thread: Path) -> dict:
@@ -477,11 +626,16 @@ def cmd_assign(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
+    if args.from_summary:
+        if args.message is not None or args.file:
+            sys.exit("--from-summary 不能和 --message / --file 一起使用。")
+        text = summary_handoff(ws, thread, state, args.yes)
+    else:
+        text = read_message(args)
     worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
     if worker not in state["parties"]:
         state["parties"][worker] = new_party()
         save_state(thread, state)
-    text = read_message(args)
     old = state.get("relay") or {}
     if old.get("status") in ("starting", "running", "waiting") and pid_alive(old.get("pid")):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
@@ -748,7 +902,8 @@ def cmd_parties(ws: Workspace, args):
     work = shares.recent_work(ws.root)
     if args.json:
         print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
-                          "share_days": shares.SHARE_DAYS}, ensure_ascii=False, indent=2))
+                          "share_days": shares.SHARE_DAYS, "summarizer": ws.config().get("summarizer")},
+                         ensure_ascii=False, indent=2))
         return
     total = sum(s["share"] for s in settings.values() if s["enabled"])
     done = sum(work.get(p, 0) for p, s in settings.items() if s["enabled"])
@@ -1058,8 +1213,15 @@ def main(argv=None):
         p.add_argument("--from", dest="sender", required=True, choices=who)
         p.add_argument("--to", help="接手方（預設：剩餘額度最多的另一方）")
         p.add_argument("--session", help="接續接手方先前的對話 ID")
+        p.add_argument("--from-summary", action="store_true", help="用討論串總結（summarize）的工作單分派")
+        p.add_argument("--yes", action="store_true", help="總結可能已過期時仍確認分派")
         add_message_args(p)
         p.set_defaults(func=cmd_assign)
+
+    p = sub.add_parser("summarize", help="請指定的一方整理討論：共識、取捨、異議與工作單（summary.md）")
+    p.add_argument("thread")
+    p.add_argument("--by", choices=AI_PARTIES, help="總結方（預設：.agora/config.json 的 summarizer）")
+    p.set_defaults(func=cmd_summarize)
 
     for name in ("status", "relay-status"):
         p = sub.add_parser(name, help="查看分派狀態與最新進度")
@@ -1145,6 +1307,6 @@ def main(argv=None):
     ws = Workspace(resolve_workspace(args.workspace))
     os.environ.setdefault("AGORA_WORKSPACE", str(ws.root))
     job_thread = os.getenv(jobs.JOB_ENV)
-    if job_thread and args.command in ("send", "reply", "auto"):
+    if job_thread and args.command in ("send", "reply", "auto", "summarize"):
         jobs.run(Path(job_thread), lambda: args.func(ws, args))
     args.func(ws, args)

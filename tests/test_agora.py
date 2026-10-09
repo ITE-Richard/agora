@@ -86,6 +86,113 @@ class TestConsensus(unittest.TestCase):
         self.assertEqual(calls, ["claude", "codex", "claude", "codex"])
 
 
+SUMMARY = """## 共識
+改用快照。
+## 採納的意見
+無
+## 放棄的意見
+無
+## 保留的異議
+無
+## 工作單
+### 範圍
+修改 `a.txt` 與 src/new_module.py；不要碰 .env。版本 0.1.1。
+### 步驟
+1. 改 a.txt
+### 驗收條件
+python -m unittest
+"""
+
+
+class TestSummary(unittest.TestCase):
+    def test_work_order_section(self):
+        order = cli.work_order(SUMMARY)
+        self.assertTrue(order.startswith("### 範圍"))
+        self.assertIn("### 驗收條件", order)
+        self.assertNotIn("## 共識", order)
+        with self.assertRaises(ValueError):
+            cli.work_order("## 共識\n沒有工作單")
+        with self.assertRaises(ValueError):
+            cli.work_order("## 工作單\n無\n## 其他\nx")
+
+    def test_referenced_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            files = cli.referenced_files(root, cli.work_order(SUMMARY))
+            self.assertEqual(set(files), {"a.txt", "src/new_module.py"})
+            self.assertIsNone(files["src/new_module.py"])
+
+    def run_summarize(self, root, reply="", low=()):
+        ws = cli.Workspace(root)
+        thread = ws.threads / "t1"
+        thread.mkdir(parents=True)
+        cli.save_state(thread, state_with(["claude", "codex"], [("human", "要不要改用快照？", False),
+                                                               ("codex", "同意", True)]))
+        prompts = []
+
+        def fake_call(prompt, session_id, opts, work, workspace, timeout, scratch):
+            prompts.append((prompt, session_id, work))
+            return reply, "sess-1", "1s"
+
+        usage = lambda p: {"remaining_pct": 1 if p in low else 80}  # noqa: E731
+        with patch.dict(os.environ, {jobs.JOB_ENV: str(thread)}), patch.dict(cli.CALLERS, {"claude": fake_call}), \
+                patch.object(quota, "usage", usage), patch("sys.stdout", io.StringIO()), \
+                patch("sys.stderr", io.StringIO()):
+            os.environ.pop(cli.NESTED_ENV, None)
+            cli.cmd_summarize(ws, type("Args", (), {"thread": "t1", "by": "claude"})())
+        return ws, thread, prompts
+
+    def test_summarize_uses_new_session_and_full_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            ws, thread, prompts = self.run_summarize(root, SUMMARY)
+            prompt, session_id, work = prompts[0]
+            self.assertIsNone(session_id)
+            self.assertFalse(work)
+            self.assertIn("要不要改用快照？", prompt)
+            self.assertIn("同意", prompt)                 # 包含 AI 自己透過 CLI 的回覆
+            state = cli.load_state(thread)
+            self.assertEqual(state["summary"]["messages"], 3)
+            self.assertIsNone(state["summary"]["error"])
+            self.assertIn("a.txt", state["summary"]["files"])
+            self.assertTrue((thread / "summary.md").exists())
+            self.assertEqual(cli.stale_reasons(root, state), [])
+            handoff = cli.summary_handoff(ws, thread, state, confirmed=False)
+            self.assertIn("### 驗收條件", handoff)
+
+    def test_stale_summary_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            ws, thread, _ = self.run_summarize(root, SUMMARY)
+            state = cli.load_state(thread)
+            state["messages"].append({"speaker": "human", "text": "再想想", "time": "now", "via_cli": False})
+            (root / "a.txt").write_text("changed", encoding="utf-8")
+            reasons = cli.stale_reasons(root, state)
+            self.assertEqual(len(reasons), 2)
+            with self.assertRaises(SystemExit) as ctx:
+                cli.summary_handoff(ws, thread, state, confirmed=False)
+            self.assertIn("過期", str(ctx.exception.code))
+            self.assertIn("### 範圍", cli.summary_handoff(ws, thread, state, confirmed=True))
+
+    def test_summary_without_work_order_refuses_assign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread, _ = self.run_summarize(Path(tmp), "## 共識\n還沒有結論")
+            state = cli.load_state(thread)
+            self.assertIn("找不到", state["summary"]["error"])
+            with self.assertRaises(SystemExit) as ctx:
+                cli.summary_handoff(ws, thread, state, confirmed=True)
+            self.assertIn("無法依總結分派", str(ctx.exception.code))
+
+    def test_low_quota_summarizer_suggests_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_summarize(Path(tmp), SUMMARY, low=("claude",))
+            self.assertIn("--by", str(ctx.exception.code))
+
+
 def git(root, *args):
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8",
                           check=True).stdout
