@@ -2,7 +2,7 @@
   "name": "agora",
   "displayName": "Agora",
   "description": "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論與分工：選擇參與的 AI 與模型、管理討論串、查看額度。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "richard-jheng",
   "license": "UNLICENSED",
   "private": true,

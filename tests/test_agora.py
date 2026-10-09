@@ -397,6 +397,56 @@ class TestLive(unittest.TestCase):
             self.assertNotIn("半則回覆", (thread / "transcript.md").read_text(encoding="utf-8"))
 
 
+class TestDiscussionFailures(unittest.TestCase):
+    def setup_thread(self, tmp):
+        ws = cli.Workspace(Path(tmp))
+        thread = ws.threads / "t1"
+        thread.mkdir(parents=True)
+        cli.save_state(thread, state_with(["claude", "antigravity", "codex"]))
+        (thread / "transcript.md").write_text("", encoding="utf-8")
+        return ws, thread
+
+    def send(self, ws, callers):
+        args = type("Args", (), {"thread": "t1", "sender": "human", "to": "all", "message": "請查證", "file": None})()
+        with patch.dict(os.environ, {jobs.JOB_ENV: str(ws.threads / "t1")}), patch.dict(cli.CALLERS, callers), \
+                patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()), \
+                patch("sys.stderr", io.StringIO()):
+            os.environ.pop(cli.NESTED_ENV, None)
+            cli.cmd_send(ws, args)
+
+    def test_denied_round_is_retried_in_same_session(self):
+        calls = []
+
+        def agy(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+            calls.append((prompt, session_id))
+            if len(calls) == 1:
+                raise parties.CallError("denied", denied=True, session_id="conv-1")
+            return "改用讀檔查證後的回覆", "conv-1", "1s"
+
+        ok = lambda *a, **k: ("好", "s", "1s")  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.setup_thread(tmp)
+            self.send(ws, {"claude": ok, "antigravity": agy, "codex": ok})
+            self.assertEqual(calls[1], (cli.DENIED_RETRY, "conv-1"))
+            state = cli.load_state(thread)
+            self.assertIn("改用讀檔查證後的回覆", [m["text"] for m in state["messages"]])
+            self.assertEqual(state["parties"]["antigravity"]["session_id"], "conv-1")
+            self.assertIn("重試一次", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+    def test_send_continues_after_a_party_fails(self):
+        def broken(*a, **k):
+            raise parties.CallError("timeout-ish failure")
+
+        ok = lambda *a, **k: ("Codex 的回覆", "s", "1s")  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.setup_thread(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                self.send(ws, {"claude": broken, "antigravity": broken, "codex": ok})
+            self.assertIn("沒有回覆", str(ctx.exception.code))
+            texts = [m["text"] for m in cli.load_state(thread)["messages"]]
+            self.assertIn("Codex 的回覆", texts)
+
+
 class TestAntigravityMode(unittest.TestCase):
     def run_call(self, work):
         from agoralib import parties
@@ -890,12 +940,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.2.1")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.0", out.getvalue())
+        self.assertIn("0.2.1", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

@@ -8,6 +8,7 @@ const path = require("path");
 const editorCtx = require("./context");
 
 const PARTIES = ["claude", "antigravity", "codex"];
+const EXTENSION_VERSION = require("./package.json").version;
 const NAMES = { claude: "Claude Code", antigravity: "Antigravity", codex: "Codex", human: "我" };
 const SHORT = { claude: "Claude", antigravity: "Agy", codex: "Codex" };
 const ACTIVE_RELAY = ["starting", "running", "waiting"];
@@ -397,6 +398,7 @@ class Model {
     this.shareDays = 7;
     this.catalog = null;   // agora models --json
     this.quota = null;     // agora quota --json
+    this.coreVersion = null;   // agora --version
     this.errors = {};
     this.emitter = new vscode.EventEmitter();
     this.onDidChange = this.emitter.event;
@@ -426,6 +428,16 @@ class Model {
     this.work = data.work || {};
     this.shareDays = data.share_days || 7;
     this.summarizer = data.summarizer || null;
+  }
+
+  async loadVersion() {
+    try {
+      const out = await runAgora(["--version"], { log: false });
+      this.coreVersion = (out.trim().match(/(\d+\.\d+\.\d+\S*)/) || [])[1] || out.trim();
+    } catch {
+      this.coreVersion = null;
+    }
+    this.emitter.fire();
   }
 
   async loadCatalog(refresh = false) {
@@ -468,6 +480,7 @@ class Model {
       catalog: this.catalog,
       quota: this.quota,
       errors: this.errors,
+      versions: { extension: EXTENSION_VERSION, core: this.coreVersion },
       names: NAMES,
       order: PARTIES,
     };
@@ -546,6 +559,7 @@ class PartiesView {
       case "ready":
         this.post();
         if (!m.parties) m.loadParties();
+        if (!m.coreVersion) m.loadVersion();
         if (!m.catalog) m.loadCatalog();
         if (!m.quota) m.loadQuota();
         break;

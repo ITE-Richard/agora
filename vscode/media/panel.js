@@ -140,6 +140,16 @@
       cat.error ? el("div", { class: "error" }, `⚠ ${cat.error}`) : null);
   }
 
+  // 版本：Agora 核心（agora --version）與擴充套件；核心以 pip install -e 安裝時會隨程式更新，擴充套件要重新打包安裝
+  function versionLine(v) {
+    const ext = `擴充套件 v${v.extension}`;
+    if (!state.workspace || !state.agoraFound) return el("p", { class: "muted small version" }, ext);
+    if (!v.core) return el("p", { class: "muted small version" }, `Agora 核心版本：查詢中… · ${ext}`);
+    const text = v.core === v.extension ? `Agora v${v.core}` : `Agora 核心 v${v.core} · ${ext}`;
+    return el("p", { class: `muted small version${v.core === v.extension ? "" : " mismatch"}` }, text,
+      v.core === v.extension ? null : el("span", { class: "hint" }, "（版本不一致，請重新打包並安裝擴充套件）"));
+  }
+
   function render() {
     if (!state) return;
     const children = [];
@@ -170,6 +180,7 @@
         "設定存在 .agora/config.json，對此專案的所有討論串生效；未參與的 AI 不會被呼叫，也不會成為接手方。"
         + "分配比例只影響自動挑選接手方（依近期接手輪數補足落後的一方），指定接手方時不受限制。"));
     }
+    children.push(versionLine(state.versions || {}));
     app.replaceChildren(...children);
   }
 

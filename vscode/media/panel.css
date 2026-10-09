@@ -187,3 +187,12 @@ input.share {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.version {
+  margin-top: 4px;
+  text-align: right;
+}
+
+.version.mismatch {
+  color: var(--vscode-editorWarning-foreground);
+}

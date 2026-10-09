@@ -307,24 +307,44 @@ def live_path(thread: Path, kind: str) -> Path:
     return thread / "live" / f"{kind}.md"
 
 
+DENIED_RETRY = ("上一輪你使用了不被允許的工具或終端指令，整輪回覆被中斷。這是純討論：請改用內建的讀檔、搜尋工具查證，"
+                "不要執行任何終端指令、不要修改檔案，然後直接回覆上面的訊息。")
+
+
+class CallFailed(SystemExit):
+    """某一方沒有回覆（已寫進逐字稿）；send 會繼續請其他人回覆，其他指令照常結束"""
+
+
 def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
-    """請 party 讀取未讀訊息並回覆（呼叫者需持有 thread_lock）"""
+    """請 party 讀取未讀訊息並回覆（呼叫者需持有 thread_lock）。
+    因為用了不被允許的工具而整輪中斷時（部分 CLI 在非互動模式會這樣），提醒它改用讀檔工具，接續同一段對話重試一次。"""
     info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
     opts = call_opts(ws, state, party)
     model = "、".join(v for v in opts.values() if v)
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
     jobs.set_current(party)
     before = git_status(ws.root)
-    live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
-    try:
-        reply, session_id, meta = CALLERS[party](build_prompt(ws, state, party), info["session_id"], opts,
-                                                 False, ws.root, TIMEOUT, thread, live=live)
-    except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        live.close()
-        add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
-        remember_session(state, party, getattr(e, "session_id", None))
-        save_state(thread, state)
-        sys.exit(f"呼叫 {NAMES[party]} 失敗：{e}")
+    prompt, session = build_prompt(ws, state, party), info["session_id"]
+    for attempt in (1, 2):
+        live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
+        try:
+            reply, session_id, meta = CALLERS[party](prompt, session, opts, False, ws.root, TIMEOUT, thread, live=live)
+            break
+        except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            live.close()
+            remember_session(state, party, getattr(e, "session_id", None))
+            if attempt == 1 and isinstance(e, CallError) and e.denied:
+                note = f"⚠️ {NAMES[party]} 用了不被允許的工具或終端指令，整輪被中斷；已提醒改用讀檔工具，重試一次。"
+                add_system_note(thread, note)
+                print(note, file=sys.stderr, flush=True)
+                if e.session_id:   # 接續被中斷的那段對話（它已經讀過訊息），只送提醒
+                    prompt, session = DENIED_RETRY, e.session_id
+                else:
+                    prompt += "\n\n" + DENIED_RETRY
+                continue
+            add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
+            save_state(thread, state)
+            raise CallFailed(f"呼叫 {NAMES[party]} 失敗：{e}")
     live.close()
     after = git_status(ws.root)
     info["session_id"] = session_id
@@ -417,9 +437,17 @@ def cmd_send(ws: Workspace, args):
         if not targets:
             print("已記錄，尚未請任何一方回覆。")
             return
+        failed = []
         for party in targets:
-            reply = invoke(ws, thread, state, party)
+            try:   # 某一方失敗時繼續請其他人回覆
+                reply = invoke(ws, thread, state, party)
+            except CallFailed as e:
+                failed.append(party)
+                print(e.code, file=sys.stderr, flush=True)
+                continue
             print(f"\n═══ {NAMES[party]} ═══\n{reply}" if len(targets) > 1 else reply)
+        if failed:
+            sys.exit(f"{'、'.join(NAMES[p] for p in failed)} 沒有回覆，原因已寫進逐字稿。")
 
 
 def cmd_reply(ws: Workspace, args):
