@@ -431,12 +431,70 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.1.0")
+        self.assertEqual(__version__, "0.1.1")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.1.0", out.getvalue())
+        self.assertIn("0.1.1", out.getvalue())
+
+
+class TestQuotaWindows(unittest.TestCase):
+    def test_codex_window_label(self):
+        self.assertEqual(quota.codex_window_label("primary", 300), "5 小時")
+        self.assertEqual(quota.codex_window_label("primary", 10080), "7 天")
+        self.assertEqual(quota.codex_window_label("primary", 60), "1 小時")
+        self.assertEqual(quota.codex_window_label("primary", 2880), "2 天")
+        self.assertEqual(quota.codex_window_label("primary", 45), "45 分鐘")
+        self.assertEqual(quota.codex_window_label("primary", None), "主要")
+        self.assertEqual(quota.codex_window_label("secondary", None), "次要")
+
+    def test_claude_usage_multi_windows(self):
+        now = time.time()
+        snap = {
+            "updated_at": int(now),
+            "five_hour": {"used_percentage": 10.0, "resets_at": now + 7200},
+            "seven_day": {"used_percentage": 30.0, "resets_at": now + 86400 * 5},
+        }
+        with patch.object(quota, "_read_json", return_value=snap):
+            u = quota.claude_usage()
+            self.assertIsNotNone(u)
+            self.assertEqual(u["window"], "seven_day")
+            self.assertEqual(u["window_label"], "7 天")
+            self.assertEqual(u["remaining_pct"], 70.0)
+            self.assertIn("five_hour", u["windows"])
+            self.assertIn("seven_day", u["windows"])
+            self.assertEqual(u["windows"]["five_hour"]["remaining_pct"], 90.0)
+            self.assertEqual(u["windows"]["five_hour"]["label"], "5 小時")
+            self.assertEqual(u["windows"]["seven_day"]["remaining_pct"], 70.0)
+            self.assertEqual(u["windows"]["seven_day"]["label"], "7 天")
+
+    def test_codex_usage_windows(self):
+        now = time.time()
+        snap = {
+            "updated_at": int(now),
+            "plan": "pro",
+            "primary": {"used_percentage": 40.0, "resets_at": now + 3600, "window_minutes": 300},
+            "secondary": {"used_percentage": 15.0, "resets_at": now + 86400 * 7, "window_minutes": 10080},
+        }
+        with patch.object(quota, "_read_json", return_value=snap):
+            u = quota.codex_usage()
+            self.assertIsNotNone(u)
+            self.assertEqual(u["window"], "primary")
+            self.assertEqual(u["window_label"], "5 小時")
+            self.assertEqual(u["remaining_pct"], 60.0)
+            self.assertEqual(u["windows"]["primary"]["label"], "5 小時")
+            self.assertEqual(u["windows"]["secondary"]["label"], "7 天")
+            self.assertEqual(u["windows"]["secondary"]["remaining_pct"], 85.0)
+
+    def test_describe_formatting(self):
+        now = time.time()
+        u1 = {"remaining_pct": 71.0, "resets_at": now + 3600, "updated_at": now, "window": "seven_day", "window_label": "7 天"}
+        self.assertIn("7 天，", quota.describe("Claude", u1))
+
+        u2 = {"remaining_pct": 100.0, "resets_at": now + 3600, "updated_at": now}
+        self.assertNotIn("，重置", quota.describe("Antigravity", u2))
+        self.assertIn("100%", quota.describe("Antigravity", u2))
 
 
 if __name__ == "__main__":

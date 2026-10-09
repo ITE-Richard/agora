@@ -26,15 +26,39 @@
     return d.toDateString() === new Date().toDateString() ? time : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
   }
 
-  function quotaBar(u, threshold) {
-    if (!u) return el("div", { class: "quota muted" }, state.quota ? "額度：無資料" : "額度：查詢中…");
-    const pct = Math.max(0, Math.min(100, u.remaining_pct));
+  function singleQuotaRow(pctVal, resetTs, label, threshold) {
+    const pct = Math.max(0, Math.min(100, pctVal));
     const level = pct < threshold ? "low" : pct < 25 ? "mid" : "ok";
     const fill = el("div", { class: `fill ${level}` });
-    fill.style.width = `${pct}%`;   // CSP 不允許 style 屬性，改用 CSSOM
-    return el("div", { class: "quota", title: `剩餘 ${pct.toFixed(1)}%，${fmtReset(u.resets_at)} 重置` },
+    fill.style.width = `${pct}%`;
+    const resetStr = fmtReset(resetTs);
+    const labelPrefix = label ? `${label}：` : "";
+    const title = `${labelPrefix}剩餘 ${pct.toFixed(1)}%，${resetStr} 重置`;
+    return el("div", { class: "quota", title },
+      label ? el("span", { class: "quota-label" }, label) : null,
       el("div", { class: "bar" }, fill),
-      el("span", { class: "quota-text" }, `${Math.round(pct)}% · ${fmtReset(u.resets_at)} 重置`));
+      el("span", { class: "quota-text" }, `${Math.round(pct)}% · ${resetStr} 重置`));
+  }
+
+  function quotaBar(u, threshold) {
+    if (!u) return el("div", { class: "quota muted" }, state.quota ? "額度：無資料" : "額度：查詢中…");
+    const winKeys = u.windows ? Object.keys(u.windows) : [];
+    if (winKeys.length > 1) {
+      const rows = winKeys.map((k) => {
+        const w = u.windows[k];
+        return singleQuotaRow(w.remaining_pct, w.resets_at, w.label || k, threshold);
+      });
+      return el("div", { class: "quota-group" }, ...rows);
+    }
+    const label = (winKeys.length === 1 && u.windows[winKeys[0]].label) || (u.window_label && u.window ? u.window_label : null);
+    const row = singleQuotaRow(u.remaining_pct, u.resets_at, label, threshold);
+    if (u.pools) {
+      const others = Object.entries(u.pools)
+        .map(([k, v]) => `${v.label || k} ${Math.round(v.remaining_pct)}%`)
+        .join("、");
+      if (others) row.title += `（額度池：${others}）`;
+    }
+    return el("div", { class: "quota-group" }, row);
   }
 
   function select(options, value, onChange, disabled) {

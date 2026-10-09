@@ -384,15 +384,43 @@ class Model {
   }
 }
 
-function quotaText(u) {
+function quotaText(u, { multiline = false } = {}) {
   if (!u) return "無資料";
-  const reset = u.resets_at ? new Date(u.resets_at * 1000) : null;
-  const sameDay = reset && reset.toDateString() === new Date().toDateString();
-  const when = reset
-    ? reset.toLocaleString("zh-TW", sameDay ? { hour: "2-digit", minute: "2-digit", hour12: false }
-      : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
-    : "未知";
-  return `剩 ${Math.round(u.remaining_pct)}%（${when} 重置）`;
+  const fmt = (ts) => {
+    if (!ts) return "未知";
+    const d = new Date(ts * 1000);
+    const sd = d.toDateString() === new Date().toDateString();
+    return d.toLocaleString("zh-TW", sd ? { hour: "2-digit", minute: "2-digit", hour12: false }
+      : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  };
+
+  const winKeys = u.windows ? Object.keys(u.windows) : [];
+  if (winKeys.length > 1) {
+    if (multiline) {
+      const details = winKeys.map((k) => {
+        const w = u.windows[k];
+        return `  • ${w.label || k}：剩 ${Math.round(w.remaining_pct)}%（${fmt(w.resets_at)} 重置）`;
+      }).join("\n");
+      const tag = u.window_label || u.window || "最緊";
+      return `剩 ${Math.round(u.remaining_pct)}%（${tag}，${fmt(u.resets_at)} 重置）\n${details}`;
+    }
+    const summary = winKeys.map((k) => {
+      const w = u.windows[k];
+      return `${w.label || k} ${Math.round(w.remaining_pct)}%`;
+    }).join(" · ");
+    return `剩 ${Math.round(u.remaining_pct)}%（${summary}）`;
+  }
+
+  const winLabel = (winKeys.length === 1 && u.windows[winKeys[0]].label) || (u.window_label && u.window ? u.window_label : null);
+  const winTag = winLabel ? `${winLabel}，` : "";
+  let base = `剩 ${Math.round(u.remaining_pct)}%（${winTag}${fmt(u.resets_at)} 重置）`;
+  if (multiline && u.pools) {
+    const others = Object.entries(u.pools)
+      .map(([k, v]) => `  • ${v.label || k}：剩 ${Math.round(v.remaining_pct)}%（${fmt(v.resets_at)} 重置）`)
+      .join("\n");
+    if (others) base += `\n${others}`;
+  }
+  return base;
 }
 
 class PartiesView {
@@ -509,7 +537,7 @@ function activate(context) {
     }).join(" · ");
     const low = enabled.some((p) => model.quota[p] && model.quota[p].remaining_pct < threshold);
     statusBar.backgroundColor = low ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
-    statusBar.tooltip = "Agora 額度\n" + enabled.map((p) => `${NAMES[p]}：${quotaText(model.quota[p])}`).join("\n");
+    statusBar.tooltip = "Agora 額度\n" + enabled.map((p) => `${NAMES[p]}：${quotaText(model.quota[p], { multiline: true })}`).join("\n");
     statusBar.show();
   };
   model.onDidChange(updateStatusBar);

@@ -58,11 +58,24 @@ select {
   font: inherit;
 }
 
+.quota-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .quota {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 0.9em;
+}
+
+.quota-label {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+  min-width: 3.2em;
+  flex-shrink: 0;
 }
 
 .bar {

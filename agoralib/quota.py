@@ -119,23 +119,38 @@ def probe_claude(timeout: int = 90) -> bool:
     return False
 
 
+CLAUDE_WINDOW_LABELS = {
+    "five_hour": "5 小時",
+    "seven_day": "7 天",
+}
+
+
 def claude_usage() -> dict | None:
-    """回傳最緊的視窗：{remaining_pct, resets_at, window, updated_at}"""
+    """回傳最緊的視窗：{remaining_pct, resets_at, window, window_label, windows, updated_at}"""
     snap = _read_json(CLAUDE_SNAPSHOT)
     if not snap:
         return None
     now = time.time()
     candidates = []
+    windows = {}
     for key in ("five_hour", "seven_day"):
         w = snap.get(key)
         if not isinstance(w, dict) or w.get("used_percentage") is None:
             continue
+        label = CLAUDE_WINDOW_LABELS.get(key, key)
         if w.get("resets_at") and w["resets_at"] < now:
-            continue  # 視窗已重置，舊數字作廢
-        candidates.append({"window": key, "remaining_pct": round(100 - w["used_percentage"], 1),
-                           "resets_at": w.get("resets_at")})
-    result = min(candidates, key=lambda c: c["remaining_pct"]) if candidates else \
-        {"window": None, "remaining_pct": 100.0, "resets_at": None}
+            win_data = {"window": key, "label": label, "remaining_pct": 100.0, "resets_at": None}
+        else:
+            win_data = {"window": key, "label": label, "remaining_pct": round(100 - w["used_percentage"], 1),
+                        "resets_at": w.get("resets_at")}
+            candidates.append(win_data)
+        windows[key] = win_data
+    if candidates:
+        result = dict(min(candidates, key=lambda c: c["remaining_pct"]))
+    else:
+        result = {"window": None, "label": None, "remaining_pct": 100.0, "resets_at": None}
+    result["window_label"] = result.get("label")
+    result["windows"] = windows
     result["updated_at"] = snap.get("updated_at")
     return result
 
@@ -209,8 +224,22 @@ def update_codex_snapshot_from_session(thread_id: str | None = None) -> bool:
     return False
 
 
+def codex_window_label(key: str, minutes: int | None) -> str:
+    if minutes:
+        if minutes == 300:
+            return "5 小時"
+        if minutes == 10080:
+            return "7 天"
+        if minutes % 1440 == 0:
+            return f"{minutes // 1440} 天"
+        if minutes % 60 == 0:
+            return f"{minutes // 60} 小時"
+        return f"{minutes} 分鐘"
+    return "主要" if key == "primary" else "次要"
+
+
 def codex_usage() -> dict | None:
-    """回傳最緊的視窗：{remaining_pct, resets_at, window, updated_at}"""
+    """回傳最緊的視窗：{remaining_pct, resets_at, window, window_label, windows, plan, updated_at}"""
     snap = _read_json(CODEX_SNAPSHOT)
     if not snap and update_codex_snapshot_from_session():
         snap = _read_json(CODEX_SNAPSHOT)
@@ -218,15 +247,27 @@ def codex_usage() -> dict | None:
         return None
     now = time.time()
     candidates = []
+    windows = {}
     for key in ("primary", "secondary"):
         w = snap.get(key)
-        if not isinstance(w, dict):
+        if not isinstance(w, dict) or w.get("used_percentage") is None:
             continue
+        minutes = w.get("window_minutes")
+        label = codex_window_label(key, minutes)
         if w.get("resets_at") and w["resets_at"] < now:
-            continue
-        candidates.append({"window": key, "remaining_pct": round(100 - w["used_percentage"], 1),
-                           "resets_at": w.get("resets_at")})
-    result = min(candidates, key=lambda c: c["remaining_pct"]) if candidates else         {"window": None, "remaining_pct": 100.0, "resets_at": None}
+            win_data = {"window": key, "label": label, "remaining_pct": 100.0, "resets_at": None, "window_minutes": minutes}
+        else:
+            win_data = {"window": key, "label": label, "remaining_pct": round(100 - w["used_percentage"], 1),
+                        "resets_at": w.get("resets_at"), "window_minutes": minutes}
+            candidates.append(win_data)
+        windows[key] = win_data
+    if candidates:
+        result = dict(min(candidates, key=lambda c: c["remaining_pct"]))
+    else:
+        result = {"window": None, "label": None, "remaining_pct": 100.0, "resets_at": None}
+    result["window_label"] = result.get("label")
+    result["windows"] = windows
+    result["plan"] = snap.get("plan")
     result["updated_at"] = snap.get("updated_at")
     return result
 
@@ -321,14 +362,16 @@ def query_antigravity() -> dict | None:
 
 
 def antigravity_usage() -> dict | None:
-    """讀快取，回傳 agy 預設額度池：{remaining_pct, resets_at, label, pools, updated_at}"""
+    """讀快取，回傳 agy 預設額度池：{remaining_pct, resets_at, label, pools, window_label, updated_at}"""
     cache = _read_json(AGY_CACHE)
     if not cache or not cache.get("pools"):
         return None
     pool = cache["pools"].get(AGY_POOL) or min(cache["pools"].values(), key=lambda p: p["remaining_pct"])
     if pool.get("resets_at") and pool["resets_at"] < time.time():
         pool = {**pool, "remaining_pct": 100.0}  # 已過重置時間
-    return {**pool, "pools": cache["pools"], "updated_at": cache["updated_at"]}
+    res = {**pool, "pools": cache["pools"], "updated_at": cache["updated_at"]}
+    res["window_label"] = AGY_POOL
+    return res
 
 
 # ───────────────────────── 更新與摘要 ─────────────────────────
@@ -386,7 +429,8 @@ def describe(name: str, usage: dict | None) -> str:
     if not usage:
         return f"{name}：無資料"
     age = int((time.time() - (usage.get("updated_at") or 0)) / 60)
-    return f"{name} 剩 {usage['remaining_pct']:.0f}%（{fmt_time(usage.get('resets_at'))} 重置，{age} 分鐘前）"
+    win_tag = f"{usage['window_label']}，" if usage.get("window_label") and usage.get("window") else ""
+    return f"{name} 剩 {usage['remaining_pct']:.0f}%（{win_tag}{fmt_time(usage.get('resets_at'))} 重置，{age} 分鐘前）"
 
 
 def low(usage: dict | None) -> bool:
@@ -425,6 +469,10 @@ def main(argv=None):
             others = "、".join(f"{k} {v['remaining_pct']:.0f}%" for k, v in u["pools"].items() if k != AGY_POOL)
             if others:
                 print(f"  其他額度池：{others}")
+        elif u and u.get("windows") and len(u["windows"]) > 1:
+            details = "、".join(f"{w['label']} 剩 {w['remaining_pct']:.0f}%（{fmt_time(w.get('resets_at'))} 重置）"
+                               for w in u["windows"].values())
+            print(f"  各視窗明細：{details}")
     for party, u in usages.items():
         if low(u):
             print(f"⚠️ {LABELS[party]} 低於 {THRESHOLD_PCT:.0f}%")
