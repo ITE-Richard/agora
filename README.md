@@ -63,6 +63,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 - 未參與的 AI 不會被請求回覆、不會被挑為接手方；額度 hook 也只在參與的 AI 之間提醒交接。設定改了，既有討論串下一次呼叫就生效。
 - 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
 - `install` 只安裝參與中 AI 的 skills、hook 與權限。
+- 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
 
 ### 工作分配比例
 

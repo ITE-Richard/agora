@@ -379,20 +379,51 @@ class TestInstall(unittest.TestCase):
             allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
                                .read_text(encoding="utf-8"))["permissions"]["allow"]
             self.assertEqual(len(allow), len(set(allow)))
-            self.assertEqual((Path(tmp) / ".gitignore").read_text(encoding="utf-8").count(".agora/"), 1)
+            self.assertFalse((Path(tmp) / ".gitignore").exists())          # 不是 git repo：不碰 .gitignore
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
 
-    def test_install_keeps_gitignore_line_endings(self):
+    def test_install_excludes_agora_files_from_git(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
-            gitignore = Path(tmp) / ".gitignore"
-            gitignore.write_bytes(b"node_modules/\r\n.agora/\r\ndata/\n")
+            root = make_repo(tmp)
+            gitignore_before = (root / ".gitignore").read_bytes()
+            (root / ".agents").mkdir()
+            (root / ".agents" / "hooks.json").write_text("{}", encoding="utf-8")   # 使用者原本就有的檔案
+            exclude = root / ".git" / "info" / "exclude"
+            exclude.write_bytes(b"# mine\r\n*.log\r\n")
             with patch.object(Path, "home", return_value=Path(home)):
-                cli.cmd_install(cli.Workspace(Path(tmp)), None)
-                self.assertEqual(gitignore.read_bytes(),
-                                 b"node_modules/\r\n.agora/\r\ndata/\n.claude/settings.local.json\r\n")
-                before = gitignore.read_bytes()
-                cli.cmd_install(cli.Workspace(Path(tmp)), None)
-            self.assertEqual(gitignore.read_bytes(), before)    # 項目都在時不改檔
+                for _ in range(2):
+                    cli.cmd_install(cli.Workspace(root), None)
+            text = exclude.read_bytes().decode("utf-8")
+            self.assertTrue(text.startswith("# mine\r\n*.log\r\n"))          # 保留原內容與行尾
+            self.assertEqual(text.count(cli.EXCLUDE_BEGIN), 1)
+            for p in ("/.agora/", "/.claude/skills/agora/", "/.claude/settings.local.json", "/.agents/skills/relay/",
+                      "/AGENTS.md"):
+                self.assertIn(p + "\r\n", text)
+            self.assertNotIn("/.agents/hooks.json", text)                  # 不是 install 建立的
+            self.assertEqual((root / ".gitignore").read_bytes(), gitignore_before)
+            self.assertEqual(git(root, "status", "--porcelain", "--untracked-files=all").strip(), "?? .agents/hooks.json")
+
+    def test_install_warns_about_tracked_agora_files(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = make_repo(tmp)
+            skill = root / ".claude" / "skills" / "agora" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("old", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "skills")
+            out = io.StringIO()
+            with patch.object(Path, "home", return_value=Path(home)), patch("sys.stdout", out):
+                cli.cmd_install(cli.Workspace(root), None)
+            self.assertIn("已被 git 追蹤", out.getvalue())
+            self.assertIn(".claude/skills/agora/SKILL.md", out.getvalue())
+
+    def test_exclude_in_subdirectory_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            sub = root / "pkg"
+            sub.mkdir()
+            exclude, _ = cli.git_exclude(sub, [".agora/"])
+            self.assertIn("/pkg/.agora/", exclude.read_text(encoding="utf-8"))
 
     def test_install_removes_old_antigravity_write_rules(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:

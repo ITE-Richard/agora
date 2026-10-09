@@ -1104,8 +1104,10 @@ def cmd_install(ws: Workspace, args):
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
+    created_agents_md = created_hooks = False
     if "codex" in enabled:
         agents_md = ws.root / "AGENTS.md"
+        created_agents_md = not agents_md.exists()
         section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
         section = section.replace("D:/github/agora", root.as_posix())
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
@@ -1141,27 +1143,75 @@ def cmd_install(ws: Workspace, args):
             if rule not in allow:
                 allow.append(rule)
     if "antigravity" in enabled:
+        created_hooks = not (ws.root / ".agents" / "hooks.json").exists()
         _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
         done.append("Antigravity hook → .agents/hooks.json")
         _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
         done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
-    # 只追加缺少的項目，不重寫整個檔案（保留原本的行尾格式）
-    gitignore = ws.root / ".gitignore"
-    text = gitignore.read_bytes().decode("utf-8") if gitignore.exists() else ""
-    missing = [e for e in (".agora/", ".claude/settings.local.json") if e not in text.splitlines()]
-    if missing:
-        eol = "\r\n" if "\r\n" in text else "\n"
-        prefix = eol if text and not text.endswith("\n") else ""
-        with open(gitignore, "a", encoding="utf-8", newline="") as f:
-            f.write(prefix + eol.join(missing) + eol)
-        done.append(f".gitignore 加入 {'、'.join(missing)}")
+    # Agora 建立的檔案寫進 .git/info/exclude（不改會被 commit 的 .gitignore）；
+    # AGENTS.md、.agents/hooks.json 可能是使用者自己的檔案，只有這次由 install 建立時才排除
+    owned = [".agora/"]
+    if "claude" in enabled:
+        owned += [".claude/skills/agora/", ".claude/skills/relay/", ".claude/settings.local.json"]
+    if "antigravity" in enabled:
+        owned += [".agents/skills/agora/", ".agents/skills/relay/"] + ([".agents/hooks.json"] if created_hooks else [])
+    if "codex" in enabled and created_agents_md:
+        owned.append("AGENTS.md")
+    excluded, tracked = git_exclude(ws.root, owned)
+    if excluded is None:
+        done.append("不是 git repo，沒有設定 git 排除")
+    else:
+        done.append(f"git 排除（{excluded}）：{'、'.join(owned)}")
 
     print(f"已將 Agora 安裝到 {ws.root}（參與的 AI：{'、'.join(NAMES[p] for p in enabled)}）：")
     for d in done:
         print(f"  • {d}")
+    if tracked:
+        print("⚠️ 以下 Agora 的檔案已被 git 追蹤，排除設定對它們無效；不想 commit 的話可執行 "
+              "git rm -r --cached <路徑>（只取消追蹤，檔案留在磁碟）：")
+        for t in tracked:
+            print(f"    {t}")
     if "claude" in enabled:
         print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+
+
+EXCLUDE_BEGIN, EXCLUDE_END = "# agora:begin（由 agora install 管理）", "# agora:end"
+
+
+def git_exclude(root: Path, paths: List[str]):
+    """把 paths（相對於工作區）加進 git 的 info/exclude 的 Agora 區段，保留區段內之前加過的項目。
+    回傳 (exclude 檔路徑或 None（不是 git repo）, 已被 git 追蹤的路徑)"""
+    def git(*args):
+        proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        return proc.stdout.strip() if proc.returncode == 0 else None
+    try:
+        if git("rev-parse", "--is-inside-work-tree") != "true":
+            return None, []
+        exclude = Path(git("rev-parse", "--git-path", "info/exclude"))
+        prefix = git("rev-parse", "--show-prefix") or ""
+    except (OSError, subprocess.SubprocessError, TypeError):
+        return None, []
+    exclude = exclude if exclude.is_absolute() else root / exclude
+    patterns = [f"/{prefix}{p}" for p in paths]   # 以 repo 根目錄為準、開頭加 / 只比對這個位置
+    text = exclude.read_bytes().decode("utf-8") if exclude.exists() else ""
+    eol = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    if EXCLUDE_BEGIN in lines and EXCLUDE_END in lines[lines.index(EXCLUDE_BEGIN):]:
+        start = lines.index(EXCLUDE_BEGIN)
+        end = lines.index(EXCLUDE_END, start)
+        old, lines = lines[start + 1:end], lines[:start] + lines[end + 1:]
+    else:
+        start, old = len(lines), []
+    block = [EXCLUDE_BEGIN] + list(dict.fromkeys(old + patterns)) + [EXCLUDE_END]
+    lines[start:start] = block
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    new = eol.join(lines) + eol
+    if new != text:
+        with open(exclude, "w", encoding="utf-8", newline="") as f:
+            f.write(new)
+    tracked = (git("ls-files", "--", *paths) or "").splitlines()
+    return exclude, tracked
 
 
 def add_message_args(p):
