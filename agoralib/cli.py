@@ -957,13 +957,16 @@ def cmd_install(ws: Workspace, args):
         _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
         done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
+    # 只追加缺少的項目，不重寫整個檔案（保留原本的行尾格式）
     gitignore = ws.root / ".gitignore"
-    lines = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
-    for entry in (".agora/", ".claude/settings.local.json"):
-        if entry not in lines:
-            lines.append(entry)
-    gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    done.append(".gitignore 加入 .agora/、.claude/settings.local.json")
+    text = gitignore.read_bytes().decode("utf-8") if gitignore.exists() else ""
+    missing = [e for e in (".agora/", ".claude/settings.local.json") if e not in text.splitlines()]
+    if missing:
+        eol = "\r\n" if "\r\n" in text else "\n"
+        prefix = eol if text and not text.endswith("\n") else ""
+        with open(gitignore, "a", encoding="utf-8", newline="") as f:
+            f.write(prefix + eol.join(missing) + eol)
+        done.append(f".gitignore 加入 {'、'.join(missing)}")
 
     print(f"已將 Agora 安裝到 {ws.root}（參與的 AI：{'、'.join(NAMES[p] for p in enabled)}）：")
     for d in done:

@@ -163,6 +163,18 @@ class TestInstall(unittest.TestCase):
             self.assertEqual((Path(tmp) / ".gitignore").read_text(encoding="utf-8").count(".agora/"), 1)
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
 
+    def test_install_keeps_gitignore_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            gitignore = Path(tmp) / ".gitignore"
+            gitignore.write_bytes(b"node_modules/\r\n.agora/\r\ndata/\n")
+            with patch.object(Path, "home", return_value=Path(home)):
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+                self.assertEqual(gitignore.read_bytes(),
+                                 b"node_modules/\r\n.agora/\r\ndata/\n.claude/settings.local.json\r\n")
+                before = gitignore.read_bytes()
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+            self.assertEqual(gitignore.read_bytes(), before)    # 項目都在時不改檔
+
     def test_install_removes_old_antigravity_write_rules(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
             ws = cli.Workspace(Path(tmp))
