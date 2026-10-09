@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agoralib import cli, config, jobs, prune, quota, quota_hook, shares, snapshot  # noqa: E402
+from agoralib import cli, config, jobs, parties, prune, quota, quota_hook, shares, snapshot  # noqa: E402
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
 
@@ -131,7 +131,7 @@ class TestSummary(unittest.TestCase):
                                                                ("codex", "同意", True)]))
         prompts = []
 
-        def fake_call(prompt, session_id, opts, work, workspace, timeout, scratch):
+        def fake_call(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
             prompts.append((prompt, session_id, work))
             return reply, "sess-1", "1s"
 
@@ -304,14 +304,82 @@ class TestSnapshot(unittest.TestCase):
             self.assertIn("不是 git repo", str(ctx.exception.code))
 
 
+class TestLive(unittest.TestCase):
+    def make_live(self, tmp):
+        return parties.Live(Path(tmp) / "live" / "discussion.md", "Claude Code", Path(tmp))
+
+    def test_claude_events(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.stderr", io.StringIO()) as err:
+            live = self.make_live(tmp)
+            delta = lambda t: {"type": "stream_event", "event": {"type": "content_block_delta",  # noqa: E731
+                                                                  "delta": {"type": "text_delta", "text": t}}}
+            for e in (delta("我先讀"), {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": str(Path(tmp) / "src" / "a.py")}}]}},
+                      {"type": "stream_event", "event": {"type": "message_start"}}, delta("結論")):
+                parties.claude_event(live, e)
+            live.write(force=True)
+            body = live.path.read_text(encoding="utf-8")
+            self.assertIn("- Read src/a.py", body)
+            self.assertIn("我先讀\n\n結論", body)
+            self.assertIn("Claude Code：Read src/a.py", err.getvalue())
+            live.close()
+            self.assertFalse(live.path.exists())
+
+    def test_codex_and_antigravity_events(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.stderr", io.StringIO()):
+            live = self.make_live(tmp)
+            parties.codex_event(live, {"type": "item.started", "item": {
+                "type": "command_execution",
+                "command": '"C:\\\\WINDOWS\\\\powershell.exe" -Command "Get-Content -LiteralPath \'a.py\'"'}})
+            parties.codex_event(live, {"type": "item.completed", "item": {"type": "agent_message", "text": "看完了"}})
+            parties.antigravity_event(live, {"event": "step_update", "step_update": {
+                "step_type": "tool", "state": "ACTIVE", "tool_name": "view_file",
+                "tool_info": {"parameters": {"AbsolutePath": str(Path(tmp) / "b.py")}}}})
+            parties.antigravity_event(live, {"event": "step_update", "step_update": {
+                "step_type": "agent_response", "state": "ACTIVE", "text_delta": "版本 0.2"}})
+            self.assertEqual(live.actions, ["執行 Get-Content -LiteralPath 'a.py'", "view_file b.py"])
+            self.assertEqual(live.text, "看完了\n\n版本 0.2")
+
+    def test_run_streams_events_and_times_out(self):
+        script = "import json,sys,time\nfor i in range(3): print(json.dumps({'n': i}), flush=True)\n" \
+                 "time.sleep(float(sys.argv[1]))\n"
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            events, _ = parties._run([sys.executable, "-c", script, "0"], Path(tmp), "", 30, seen.append)
+            self.assertEqual([e["n"] for e in events], [0, 1, 2])
+            self.assertEqual(seen, events)
+            start = time.time()
+            with self.assertRaises(subprocess.TimeoutExpired):   # 逾時 = timeout + 60 秒，這裡是 1 秒
+                parties._run([sys.executable, "-c", script, "30"], Path(tmp), "", -59, None)
+            self.assertLess(time.time() - start, 15)
+
+    def test_stop_discards_partial_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude"]))
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            live = cli.live_path(thread, "discussion")
+            live.parent.mkdir()
+            live.write_text("半則回覆", encoding="utf-8")
+            jobs.update(thread, status="running", pid=999999, current="claude")
+            with patch.object(jobs, "active", return_value={"pid": None, "current": "claude"}), \
+                    patch("sys.stdout", io.StringIO()):
+                os.environ.pop(cli.NESTED_ENV, None)
+                cli.cmd_stop(ws, type("Args", (), {"thread": "t1"})())
+            self.assertFalse(live.exists())
+            self.assertNotIn("半則回覆", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+
 class TestAntigravityMode(unittest.TestCase):
     def run_call(self, work):
         from agoralib import parties
         seen = {}
 
-        def fake_run(cmd, workspace, stdin_text, timeout):
+        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None):
             seen["cmd"] = cmd
-            return [{"status": "SUCCESS", "response": "ok", "conversation_id": "c1"}], ""
+            return [{"event": "result", "result": {"status": "SUCCESS", "response": "ok", "conversation_id": "c1"}}], ""
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(parties, "_run", fake_run):
             parties.call_antigravity("hi", None, {}, work, Path(tmp), 60, Path(tmp))
@@ -777,12 +845,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.1.1")
+        self.assertEqual(__version__, "0.2.0")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.1.1", out.getvalue())
+        self.assertIn("0.2.0", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

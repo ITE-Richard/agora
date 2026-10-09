@@ -772,6 +772,18 @@ function activate(context) {
     threads.refresh();
   });
 
+  command("agora.openLive", async (arg) => {
+    const thread = await pickThread(arg);
+    if (!thread) return;
+    await activity.load();
+    const live = (activity.items || []).filter((x) => x.thread === thread.id && x.live).map((x) => x.live);
+    if (!live.length) {
+      vscode.window.showInformationMessage(`「${thread.state.topic}」目前沒有進行中的回覆。`);
+      return;
+    }
+    for (const file of live) await vscode.commands.executeCommand("markdown.showPreview", vscode.Uri.file(file));
+  });
+
   command("agora.summarize", async (arg) => {
     const thread = await pickThread(arg);
     if (!thread) return;

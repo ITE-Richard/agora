@@ -10,7 +10,8 @@ Agora：讓 Claude Code、Antigravity、Codex（與使用者）在同一個工�
 呼叫者只負責顯示進度，中斷後可用 wait 重新接上。
 
 討論串存在 <工作區>/.agora/threads/<id>/：state.json（程式用）、transcript.md（給人看）、
-job.json / job.log（討論的背景程序）、progress.md / control.json / worker.log（分派工作時）。
+job.json / job.log（討論的背景程序）、progress.md / control.json / worker.log（分派工作時）、
+live/discussion.md、live/work.md（回覆進行中的內容，完成後刪除）。
 """
 
 import argparse
@@ -27,7 +28,7 @@ from typing import List, Optional
 
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
-                              NESTED_ENV, CallError, agora_cmd, canonical)
+                              NESTED_ENV, CallError, Live, agora_cmd, canonical)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -301,6 +302,11 @@ def build_prompt(ws: Workspace, state: dict, party: str) -> str:
     return "\n\n".join(parts)
 
 
+def live_path(thread: Path, kind: str) -> Path:
+    """回覆進行中的內容（kind：discussion 為討論與總結、work 為接手工作）"""
+    return thread / "live" / f"{kind}.md"
+
+
 def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
     """請 party 讀取未讀訊息並回覆（呼叫者需持有 thread_lock）"""
     info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
@@ -309,14 +315,17 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
     jobs.set_current(party)
     before = git_status(ws.root)
+    live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
     try:
         reply, session_id, meta = CALLERS[party](build_prompt(ws, state, party), info["session_id"], opts,
-                                                 False, ws.root, TIMEOUT, thread)
+                                                 False, ws.root, TIMEOUT, thread, live=live)
     except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        live.close()
         add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
         remember_session(state, party, getattr(e, "session_id", None))
         save_state(thread, state)
         sys.exit(f"呼叫 {NAMES[party]} 失敗：{e}")
+    live.close()
     after = git_status(ws.root)
     info["session_id"] = session_id
     remember_session(state, party, session_id)
@@ -537,13 +546,16 @@ def cmd_summarize(ws: Workspace, args):
         opts = call_opts(ws, state, party)
         print(f"…等待 {NAMES[party]} 產出總結", file=sys.stderr, flush=True)
         jobs.set_current(party)
+        live = Live(live_path(thread, "discussion"), f"{NAMES[party]}（總結）", ws.root)
         try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿
-            reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread)
+            reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            live.close()
             add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
             remember_session(state, party, getattr(e, "session_id", None))
             save_state(thread, state)
             sys.exit(f"{NAMES[party]} 產出總結失敗：{e}")
+        live.close()
         remember_session(state, party, session_id)
         try:
             order, error = work_order(reply), None
@@ -747,10 +759,12 @@ def cmd_work(ws: Workspace, args):
         state = load_state(thread)
         before = git_status(ws.root)
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
+        live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
         try:
             reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), call_opts(ws, state, worker),
-                                                      True, ws.root, WORK_TIMEOUT, thread)
+                                                      True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            live.close()
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
@@ -771,6 +785,7 @@ def cmd_work(ws: Workspace, args):
                 continue
             update_relay(thread, status="failed", error=str(e)[:500])
             return
+        live.close()
         changed = git_status(ws.root)
 
         with thread_lock(thread, wait=120):
@@ -944,8 +959,9 @@ def cmd_stop(ws: Workspace, args):
         jobs.kill_tree(job["pid"])
     jobs.update(thread, status="stopped", current=None, finished=now_str())
     (thread / ".lock").unlink(missing_ok=True)
+    live_path(thread, "discussion").unlink(missing_ok=True)   # 被終止的程序來不及清掉進行中的內容
     current = job.get("current")
-    add_system_note(thread, "⏹ 已停止背景討論" + (f"（當時在等 {NAMES[current]} 回覆）" if current else "") + "。")
+    add_system_note(thread, "⏹ 已停止背景討論" + (f"（當時在等 {NAMES[current]} 回覆，未完成的回覆不寫入逐字稿）" if current else "") + "。")
     print("已停止。")
 
 
@@ -957,16 +973,18 @@ def activity(ws: Workspace) -> List[dict]:
         state = load_state(thread)
         job = jobs.active(thread)
         if job:
+            live = live_path(thread, "discussion")
             items.append({"thread": thread.name, "topic": state["topic"], "type": "discussion", "kind": job.get("kind"),
                           "current": job.get("current"), "since": job.get("since"), "started": job.get("started"),
-                          "pid": job.get("pid")})
+                          "pid": job.get("pid"), "live": str(live) if live.exists() else None})
         relay = state.get("relay") or {}
         if relay.get("status") in ("starting", "running", "waiting"):
             if pid_alive(relay.get("pid")):
+                live = live_path(thread, "work")
                 items.append({"thread": thread.name, "topic": state["topic"], "type": "relay",
                               "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),
                               "waiting_until": relay.get("waiting_until"), "started": relay.get("started"),
-                              "pid": relay.get("pid")})
+                              "pid": relay.get("pid"), "live": str(live) if live.exists() else None})
             else:
                 update_relay(thread, status="interrupted")
     return items

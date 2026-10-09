@@ -2,7 +2,7 @@
   "name": "agora",
   "displayName": "Agora",
   "description": "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論與分工：選擇參與的 AI 與模型、管理討論串、查看額度。",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "richard-jheng",
   "license": "UNLICENSED",
   "private": true,
@@ -63,6 +63,12 @@
         "title": "開啟逐字稿",
         "category": "Agora",
         "icon": "$(open-preview)"
+      },
+      {
+        "command": "agora.openLive",
+        "title": "開啟即時回覆",
+        "category": "Agora",
+        "icon": "$(pulse)"
       },
       {
         "command": "agora.send",
@@ -230,6 +236,16 @@
           "command": "agora.stopJob",
           "when": "view == agora.threads && viewItem =~ /-job/",
           "group": "1_talk@3"
+        },
+        {
+          "command": "agora.openLive",
+          "when": "view == agora.threads && viewItem =~ /-job|relay-active/",
+          "group": "inline@0"
+        },
+        {
+          "command": "agora.openLive",
+          "when": "view == agora.threads && viewItem =~ /-job|relay-active/",
+          "group": "1_talk@0"
         }
       ],
       "commandPalette": [
@@ -259,6 +275,10 @@
         },
         {
           "command": "agora.stopJob",
+          "when": "false"
+        },
+        {
+          "command": "agora.openLive",
           "when": "false"
         }
       ]
