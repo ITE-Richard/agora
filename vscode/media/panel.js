@@ -124,6 +124,20 @@
         el("span", { class: "share-line" }, input, el("span", { class: "share-text" }, `${target} · ${actual}`)));
     }
 
+    // 內建子代理：被 Agora 呼叫時能否啟動自己的子代理；各家關閉的方式與效果不同
+    let subagentRow = null;
+    if (!disabled) {
+      const hint = SUBAGENT_HINTS[p] || "";
+      subagentRow = el("label", { class: "row", title: hint },
+        el("span", { class: "label" }, "內建子代理"),
+        el("span", { class: "share-line" },
+          el("input", {
+            type: "checkbox", checked: setting.subagents !== false,
+            onchange: (e) => vscode.postMessage({ type: "set", party: p, field: "subagents", value: e.target.checked ? "on" : "off" }),
+          }),
+          el("span", { class: "share-text" }, setting.subagents !== false ? "允許" : `不允許 · ${SUBAGENT_OFF[p] || ""}`)));
+    }
+
     const quota = state.quota ? state.quota[p] : null;
     return el("section", { class: `card${disabled ? " disabled" : ""}` },
       el("label", { class: "head" },
@@ -137,6 +151,7 @@
       el("label", { class: "row" }, el("span", { class: "label" }, "模型"), modelSelect),
       effortRow,
       shareRow,
+      subagentRow,
       cat.error ? el("div", { class: "error" }, `⚠ ${cat.error}`) : null);
   }
 
@@ -149,6 +164,13 @@
     return el("p", { class: `muted small version${v.core === v.extension ? "" : " mismatch"}` }, text,
       v.core === v.extension ? null : el("span", { class: "hint" }, "（版本不一致，請重新打包並安裝擴充套件）"));
   }
+
+  const SUBAGENT_HINTS = {
+    claude: "被 Agora 呼叫時能否用 Task 派出 Claude Code 的內建子代理（general-purpose、Explore 等）。關閉時直接禁用該工具。",
+    antigravity: "被 Agora 呼叫時能否用 invoke_subagent 等工具派出 Antigravity 的子代理。關閉時由專案裡的 hook 擋下（需已安裝或更新到此專案）。",
+    codex: "被 Agora 呼叫時能否用 spawn_agent 派出 Codex 的子代理。Codex 目前無法強制關閉：關閉時只在提示中要求不要使用，若仍使用會標記在逐字稿。",
+  };
+  const SUBAGENT_OFF = { claude: "已禁用", antigravity: "由 hook 擋下", codex: "只能提示，無法強制" };
 
   function render() {
     if (!state) return;

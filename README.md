@@ -42,6 +42,7 @@ A=agora    # 或 A="python D:/github/agora/agora.py"
 $A parties                                          # 此專案參與的 AI 與模型
 $A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
 $A parties --share claude=5 --share codex=3          # 自動分派的工作比例
+$A parties --subagents codex=off                    # 被 Agora 呼叫時能否啟動自己的內建子代理（on / off）
 $A models [--refresh]                               # 各 AI 可選的模型與推理強度
 $A new "主題" [--parties claude,codex] [--model codex=gpt-5] [--effort codex=high]
 $A send <id> --from claude --message "..."          # 預設依序請其他所有 AI 回覆
@@ -81,8 +82,18 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 - 未參與的 AI 不會被請求回覆、不會被挑為接手方；額度 hook 也只在參與的 AI 之間提醒交接。設定改了，既有討論串下一次呼叫就生效。
 - 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
-- `install` 只安裝參與中 AI 的 skills、hook 與權限。
+- `install` 只安裝參與中 AI 的 skills、hook 與權限。`agora install --status` 檢查此專案缺少或過期的項目（只有 `.agora/config.json` 不算安裝；在面板調整設定就會建立它）。
 - 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
+
+### 內建子代理
+
+三個 AI 都有自己的內建子代理。`subagents`（預設允許）決定被 Agora 呼叫時能不能使用：
+
+| AI | 內建子代理 | 不允許時 |
+|---|---|---|
+| Claude Code | `Task`（general-purpose、Explore、Plan 等） | `--disallowedTools Task`，工具直接移除 |
+| Antigravity | `invoke_subagent`、`define_subagent`、`manage_subagents`、`browser_subagent` | `install` 裝在 `.agents/hooks.json` 的 PreToolUse hook 擋下（只看 Agora 傳的環境變數，你自己開的 Antigravity 不受影響）；被擋時它會改用自己的工具完成 |
+| Codex | `spawn_agent` 等 | 目前版本無法強制關閉（關掉 `multi_agent` 功能後仍可使用），只在提示中要求不要使用；若仍使用，逐字稿的附註會標記 |
 
 ### 工作分配比例
 

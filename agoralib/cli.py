@@ -29,7 +29,7 @@ from typing import List, Optional
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               NESTED_ENV, CallError, Live, agora_cmd, canonical,
-                              quote_path)
+                              no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -278,10 +278,11 @@ def require_enabled(ws: Workspace, party: str) -> str:
 
 
 def call_opts(ws: Workspace, state: dict, party: str) -> dict:
-    """模型與推理強度：討論串自己指定的優先，其次是專案設定，都沒有就用 CLI 預設"""
+    """模型與推理強度：討論串自己指定的優先，其次是專案設定，都沒有就用 CLI 預設；
+    能否啟動內建子代理只看專案設定"""
     info = state["parties"].get(party) or {}
     settings = config.party_settings(ws.root)[party]
-    return {f: info.get(f) or settings.get(f) for f in config.FIELDS}
+    return {**{f: info.get(f) or settings.get(f) for f in config.FIELDS}, "subagents": settings["subagents"]}
 
 
 # ───────────────────────── 討論 ─────────────────────────
@@ -321,7 +322,7 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
     因為用了不被允許的工具而整輪中斷時（部分 CLI 在非互動模式會這樣），提醒它改用讀檔工具，接續同一段對話重試一次。"""
     info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
     opts = call_opts(ws, state, party)
-    model = "、".join(v for v in opts.values() if v)
+    model = "、".join(opts[f] for f in config.FIELDS if opts.get(f))
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
     jobs.set_current(party)
     before = git_status(ws.root)
@@ -937,10 +938,11 @@ def cmd_parties(ws: Workspace, args):
     if bad:
         sys.exit(f"未知的 AI：{bad}，可用：{list(AI_PARTIES)}")
     models_, efforts, shares_ = parse_pairs(args.model), parse_pairs(args.effort), parse_pairs(args.share)
-    if enable or disable or models_ or efforts or shares_:
+    subagents = parse_pairs(args.subagents)
+    if enable or disable or models_ or efforts or shares_ or subagents:
         guard_nested()
         try:
-            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_)
+            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents)
         except ValueError as e:
             sys.exit(str(e))
     else:
@@ -962,6 +964,7 @@ def cmd_parties(ws: Workspace, args):
             target = f"{int(s['share'] / total * 100 + 0.5)}%" if total else "-"
             actual = f"{int(work.get(p, 0) / done * 100 + 0.5)}%" if done else "-"
             line += f"｜分配比例 {s['share']}（目標 {target}，近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪 {actual}）"
+            line += f"｜內建子代理：{'允許' if s['subagents'] else '不允許'}"
         print(line)
 
 
@@ -1139,8 +1142,10 @@ def install_plan() -> dict:
     """install 要寫入的指令：hook、舊式路徑指令、給 AI 用的指令（有 editable 的 agora 時用它）"""
     root = AGORA_ROOT_DIR
     legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
+    hook_file = root / "agoralib" / "quota_hook.py"
     return {"root": root, "legacy": legacy,
-            "hook": f"python {quote_path((root / 'agoralib' / 'quota_hook.py').as_posix())}",
+            "hook": f"python {quote_path(hook_file.as_posix())}",
+            "agy_hook": f"python {no_space_path(hook_file)}",   # Antigravity 執行 hook 時不處理引號
             "cmd": agora_cmd() if agora_cmd() == "agora" else legacy}
 
 
@@ -1190,7 +1195,12 @@ def install_status(ws: Workspace) -> dict:
     if "antigravity" in enabled:
         commands = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
             h.get("command", "") for h in ((d.get("agora-quota") or {}).get("PreInvocation") or [])])
-        check("Antigravity 額度 hook", bool(commands), f"{plan['hook']} agy-pre" in commands)
+        check("Antigravity 額度 hook", bool(commands), f"{plan['agy_hook']} agy-pre" in commands)
+        matchers = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
+            (g.get("matcher"), h.get("command", "")) for g in ((d.get("agora-subagents") or {}).get("PreToolUse") or [])
+            for h in g.get("hooks", [])])
+        check("Antigravity 子代理開關 hook", bool(matchers),
+              sorted(matchers) == sorted((t, f"{plan['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
@@ -1258,7 +1268,12 @@ def cmd_install(ws: Workspace, args):
         done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
 
     def agy_hooks(data):
-        data["agora-quota"] = {"PreInvocation": [{"type": "command", "command": f"{hook} agy-pre", "timeout": 15}]}
+        agy_hook = plan["agy_hook"]
+        data["agora-quota"] = {"PreInvocation": [{"type": "command", "command": f"{agy_hook} agy-pre", "timeout": 15}]}
+        # 被 Agora 呼叫、且設定不允許內建子代理時擋下（看環境變數，使用者自己開的 Antigravity 不受影響）
+        data["agora-subagents"] = {"PreToolUse": [
+            {"matcher": tool, "hooks": [{"type": "command", "command": f"{agy_hook} agy-tool", "timeout": 15}]}
+            for tool in AGY_SUBAGENT_TOOLS]}
 
     # Antigravity CLI 的權限是全域、完整比對：只開放接手方需要的固定指令。
     # 寫檔不放在這裡（否則討論時也能改檔），接手工作時以 --mode accept-edits 開放；舊版加過的寫入規則一併移除。
@@ -1275,7 +1290,7 @@ def cmd_install(ws: Workspace, args):
     if "antigravity" in enabled:
         created_hooks = not (ws.root / ".agents" / "hooks.json").exists()
         _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
-        done.append("Antigravity hook → .agents/hooks.json")
+        done.append("Antigravity hook（額度、子代理開關）→ .agents/hooks.json")
         _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
         done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
@@ -1433,6 +1448,8 @@ def main(argv=None):
     p.add_argument("--effort", action="append", help="例如 --effort claude=high；值為 default 表示改回 CLI 預設")
     p.add_argument("--share", action="append",
                    help="自動分派的工作比例，例如 --share claude=5 --share codex=3；0 表示不自動分派給它，default 改回 1")
+    p.add_argument("--subagents", action="append",
+                   help="被 Agora 呼叫時能否啟動自己的內建子代理，例如 --subagents claude=off（on / off，預設 on）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_parties)
 

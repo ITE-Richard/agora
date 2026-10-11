@@ -4,7 +4,7 @@
 {
   "check": ["python", "-m", "unittest", "discover", "-s", "tests"],
   "parties": {
-    "claude":      {"enabled": true,  "model": "opus", "effort": "high", "share": 2},
+    "claude":      {"enabled": true,  "model": "opus", "effort": "high", "share": 2, "subagents": false},
     "antigravity": {"enabled": false},
     "codex":       {"enabled": true,  "model": "gpt-6.1-sol", "share": 1}
   }
@@ -13,6 +13,8 @@
 parties 沒寫到的 AI 視為啟用、模型與推理強度沿用各 CLI 自己的預設。
 討論串可以另外指定模型（new --model），優先於這裡的設定。
 share 是自動挑選接手方時的工作分配比例（預設 1，0 表示不自動分派給它），見 shares.py。
+subagents 是被 Agora 呼叫時能否啟動自己的內建子代理（預設 true）：Claude Code 禁用 Task 工具；
+Antigravity 由 install 裝的 PreToolUse hook 擋下 invoke_subagent 等工具；Codex 目前無法強制關閉，只在提示中要求。
 """
 
 import json
@@ -49,7 +51,8 @@ def party_settings(root: Path, data: Optional[dict] = None) -> Dict[str, dict]:
         share = item.get("share", 1)
         out[p] = {"enabled": item.get("enabled", True) is not False,
                   **{f: item.get(f) or None for f in FIELDS},
-                  "share": share if isinstance(share, int) and share >= 0 else 1}
+                  "share": share if isinstance(share, int) and share >= 0 else 1,
+                  "subagents": item.get("subagents", True) is not False}
     return out
 
 
@@ -63,9 +66,10 @@ def shares(root: Path) -> Dict[str, int]:
 
 def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str] = (),
                    models: Optional[Dict[str, str]] = None, efforts: Optional[Dict[str, str]] = None,
-                   shares: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
-    """更新參與方設定；模型或推理強度給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1。
-    至少要保留一個 AI。"""
+                   shares: Optional[Dict[str, str]] = None,
+                   subagents: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
+    """更新參與方設定；模型或推理強度給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1，
+    子代理給 on / off（default 表示改回允許）。至少要保留一個 AI。"""
     data = load(root)
     parties = data.setdefault("parties", {})
     for p, value in [(p, True) for p in enable] + [(p, False) for p in disable]:
@@ -89,6 +93,15 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
         if share < 0:
             raise ValueError(f"分配比例必須是非負整數：{p}={value}")
         item["share"] = share
+    for p, value in (subagents or {}).items():
+        item = parties.setdefault(p, {})
+        value = str(value).strip().lower()
+        if value in ("", "default", "on", "true", "1", "yes"):
+            item.pop("subagents", None)
+        elif value in ("off", "false", "0", "no"):
+            item["subagents"] = False
+        else:
+            raise ValueError(f"子代理設定只能是 on 或 off：{p}={value}")
     settings = party_settings(root, data)
     if not any(s["enabled"] for s in settings.values()):
         raise ValueError("至少要啟用一個 AI。")

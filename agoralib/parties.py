@@ -32,7 +32,24 @@ def quote_path(path: str) -> str:
     return f'"{path}"' if " " in path else path
 
 
+def no_space_path(path: Path) -> str:
+    """不含空格的路徑（Windows 用 8.3 短路徑）：給不處理引號的地方用，例如 Antigravity 的 hook 指令"""
+    text = path.as_posix()
+    if " " in text and sys.platform.startswith("win"):
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)):
+                text = Path(buf.value).as_posix()
+        except (OSError, AttributeError):
+            pass
+    return quote_path(text)   # 仍有空格（例如停用了 8.3 名稱）時只能加引號
+
+
 LEGACY_CMD = f"python {quote_path(AGORA_ROOT.as_posix() + '/agora.py')}"
+SUBAGENTS_ENV = "AGORA_SUBAGENTS"   # 被 Agora 呼叫時為 "0" 表示不允許內建子代理（Antigravity 的 hook 依此擋下）
+AGY_SUBAGENT_TOOLS = ("invoke_subagent", "define_subagent", "manage_subagents", "browser_subagent")
+NO_SUBAGENT_NOTE = "（使用者設定：這次不要使用你內建的子代理工具（例如 spawn_agent），請自己完成。）\n\n"
 DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
 QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|429|resource_exhausted|credits", re.I)
@@ -160,9 +177,9 @@ def describe_tool(name: str, params: dict, workspace: Path) -> str:
 
 
 def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
-         on_event: Optional[Callable[[dict], None]] = None) -> Tuple[list, str]:
+         on_event: Optional[Callable[[dict], None]] = None, extra_env: Optional[dict] = None) -> Tuple[list, str]:
     """執行 CLI，逐行解析 JSON 事件（on_event 即時處理）；逾時會終止整棵程序樹"""
-    env = {**os.environ, NESTED_ENV: "1"}
+    env = {**os.environ, NESTED_ENV: "1", **(extra_env or {})}
     env.pop("AGORA_JOB", None)   # AI 執行的 agora 指令（quota、check）不是背景討論程序
     proc = subprocess.Popen(cmd, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
@@ -239,6 +256,8 @@ def antigravity_event(live: Live, e: dict):
     step = e.get("step_update") or {}
     if step.get("step_type") == "agent_response":
         live.add_text(step.get("text_delta") or "")
+    elif step.get("step_type") == "subagent" and step.get("state") in ("ACTIVE", "ERROR"):
+        live.add_action(f"子代理 {step.get('tool_name') or ''}{'（被擋下）' if step.get('state') == 'ERROR' else ''}".strip())
     elif step.get("step_type") == "tool" and step.get("state") == "ACTIVE":
         live.add_action(describe_tool(step.get("tool_name") or "tool",
                                       (step.get("tool_info") or {}).get("parameters") or {}, live.workspace))
@@ -263,7 +282,8 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             cmd += ["--model", opts["model"]]
         if opts.get("effort"):
             cmd += ["--effort", opts["effort"]]
-        events, stderr = _run(cmd, workspace, None, timeout, live and (lambda e: antigravity_event(live, e)))
+        events, stderr = _run(cmd, workspace, None, timeout, live and (lambda e: antigravity_event(live, e)),
+                              {SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
         reply = (result.get("response") or "").strip()
@@ -308,6 +328,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
                 "--disallowedTools", "Read(./.env)", "Edit(./.env)"]
     else:
         cmd += ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
+    if not opts.get("subagents", True):
+        cmd += ["Task", "Agent"]   # 接在 --disallowedTools 之後：禁用內建子代理（新版改名為 Agent）
     if session_id:
         cmd += ["--resume", session_id]
     if opts.get("model"):
@@ -337,6 +359,8 @@ def codex_event(live: Live, e: dict):
             command = item.get("command") or ""
             m = re.search(r'-Command\s+"(.*)"\s*$', command, re.S)   # Windows 上包在 powershell -Command "…" 裡
             live.add_action(describe_tool("執行", {"command": m.group(1) if m else command}, live.workspace))
+        elif item.get("type") == "collab_tool_call":
+            live.add_action(f"子代理 {item.get('tool') or ''}".strip())
         elif item.get("type") not in (None, "agent_message", "reasoning"):
             live.add_action(item["type"])
     elif e.get("type") == "item.completed" and item.get("type") == "agent_message":
@@ -352,6 +376,11 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
         cmd += ["-m", opts["model"]]
     if opts.get("effort"):
         cmd += ["-c", f'model_reasoning_effort="{opts["effort"]}"']
+    allow_subagents = opts.get("subagents", True)
+    if not allow_subagents:
+        # multi_agent 關掉後 spawn_agent 在目前版本仍可用，所以同時在提示中要求，並在附註標記是否用了
+        cmd += ["--disable", "multi_agent"]
+        prompt = NO_SUBAGENT_NOTE + prompt
     cmd += ["resume", session_id, "-"] if session_id else ["-"]
     events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: codex_event(live, e)))
     thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), session_id)
@@ -366,6 +395,8 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
         raise CallError(f"Codex 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)), session_id=thread_id)
     usage = next((e.get("usage") for e in reversed(events) if e.get("type") == "turn.completed"), {}) or {}
     meta = f"{usage.get('input_tokens', '?')}+{usage.get('output_tokens', '?')} tokens"
+    if not allow_subagents and any((e.get("item") or {}).get("type") == "collab_tool_call" for e in events):
+        meta += "，⚠ 仍使用了內建子代理（Codex 無法強制關閉）"
     return reply, thread_id, meta
 
 

@@ -447,12 +447,96 @@ class TestDiscussionFailures(unittest.TestCase):
             self.assertIn("Codex 的回覆", texts)
 
 
+class TestSubagents(unittest.TestCase):
+    def capture(self, caller, opts, events=None):
+        seen = {}
+
+        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None, extra_env=None):
+            seen.update(cmd=cmd, stdin=stdin_text, env=extra_env or {})
+            return events or [], ""
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(parties, "_run", fake_run):
+            try:
+                result = caller("問題", None, opts, False, Path(tmp), 60, Path(tmp))
+            except parties.CallError:
+                result = None
+        return seen, result
+
+    def test_setting_defaults_and_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(config.party_settings(root)["codex"]["subagents"])
+            settings = config.update_parties(root, subagents={"codex": "off"})
+            self.assertFalse(settings["codex"]["subagents"])
+            self.assertTrue(config.update_parties(root, subagents={"codex": "on"})["codex"]["subagents"])
+            with self.assertRaises(ValueError):
+                config.update_parties(root, subagents={"codex": "maybe"})
+
+    def test_claude_disallows_task_only_when_off(self):
+        ok = [{"type": "result", "result": "好", "session_id": "s"}]
+        seen, _ = self.capture(parties.call_claude, {"subagents": False}, ok)
+        self.assertIn("Task", seen["cmd"])
+        self.assertLess(seen["cmd"].index("--disallowedTools"), seen["cmd"].index("Task"))
+        seen, _ = self.capture(parties.call_claude, {"subagents": True}, ok)
+        self.assertNotIn("Task", seen["cmd"])
+
+    def test_codex_disables_feature_asks_in_prompt_and_flags_usage(self):
+        events = [{"type": "thread.started", "thread_id": "t"},
+                  {"type": "item.started", "item": {"type": "collab_tool_call", "tool": "wait"}},
+                  {"type": "item.completed", "item": {"type": "agent_message", "text": "完成"}}]
+        with patch.object(parties.quota, "update_codex_snapshot_from_session"):
+            seen, result = self.capture(parties.call_codex, {"subagents": False}, events)
+            self.assertIn("multi_agent", seen["cmd"])
+            self.assertTrue(seen["stdin"].startswith(parties.NO_SUBAGENT_NOTE))
+            self.assertIn("仍使用了內建子代理", result[2])
+            seen, result = self.capture(parties.call_codex, {"subagents": True}, events)
+            self.assertNotIn("multi_agent", seen["cmd"])
+            self.assertNotIn("子代理", result[2])
+
+    def test_antigravity_passes_setting_to_hook(self):
+        ok = [{"event": "result", "result": {"status": "SUCCESS", "response": "好", "conversation_id": "c"}}]
+        seen, _ = self.capture(parties.call_antigravity, {"subagents": False}, ok)
+        self.assertEqual(seen["env"], {parties.SUBAGENTS_ENV: "0"})
+        seen, _ = self.capture(parties.call_antigravity, {}, ok)
+        self.assertEqual(seen["env"], {parties.SUBAGENTS_ENV: "1"})
+
+    def test_agy_tool_hook_denies_only_when_off(self):
+        hook = Path(cli.AGORA_ROOT_DIR) / "agoralib" / "quota_hook.py"
+        for value, decision in (("0", "deny"), ("1", "allow"), (None, "allow")):
+            env = {k: v for k, v in os.environ.items() if k != "AGORA_SUBAGENTS"}
+            if value is not None:
+                env["AGORA_SUBAGENTS"] = value
+            out = subprocess.run([sys.executable, str(hook), "agy-tool"], input='{"toolCall":{"name":"invoke_subagent"}}',
+                                 capture_output=True, text=True, encoding="utf-8", env=env, timeout=60).stdout
+            self.assertEqual(json.loads(out)["decision"], decision, value)
+
+    def test_install_adds_subagent_hook_without_quotes(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            ws = cli.Workspace(Path(tmp))
+            with patch.object(Path, "home", return_value=Path(home)):
+                cli.cmd_install(ws, None)
+            hooks = json.loads((ws.root / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+            groups = hooks["agora-subagents"]["PreToolUse"]
+            self.assertEqual({g["matcher"] for g in groups}, set(parties.AGY_SUBAGENT_TOOLS))
+            self.assertTrue(all('"' not in h["command"] for g in groups for h in g["hooks"]))
+            self.assertEqual(cli.install_status(ws)["state"], "installed")
+
+    @unittest.skipUnless(sys.platform.startswith("win"), "8.3 短路徑只在 Windows")
+    def test_no_space_path_uses_short_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "Has Space"
+            folder.mkdir()
+            (folder / "x.py").write_text("", encoding="utf-8")
+            text = parties.no_space_path(folder / "x.py")
+            self.assertTrue(" " not in text or text.startswith('"'))
+
+
 class TestAntigravityMode(unittest.TestCase):
     def run_call(self, work):
         from agoralib import parties
         seen = {}
 
-        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None):
+        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None, extra_env=None):
             seen["cmd"] = cmd
             return [{"event": "result", "result": {"status": "SUCCESS", "response": "ok", "conversation_id": "c1"}}], ""
 
@@ -689,8 +773,8 @@ class TestPartySettings(unittest.TestCase):
             config.update_parties(ws.root, models={"codex": "proj-model", "claude": "opus"}, efforts={"codex": "low"})
             s = state_with(["claude", "codex"])
             s["parties"]["codex"]["model"] = "thread-model"
-            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low"})
-            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None})
+            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low", "subagents": True})
+            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None, "subagents": True})
 
     def test_disabled_party_is_not_asked_to_reply(self):
         s = state_with(["claude", "antigravity", "codex"])
@@ -982,12 +1066,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.2")
+        self.assertEqual(__version__, "0.2.3")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.2", out.getvalue())
+        self.assertIn("0.2.3", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

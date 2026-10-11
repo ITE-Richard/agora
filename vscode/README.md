@@ -4,6 +4,8 @@
 
 - **AI 與模型**：勾選這個專案要讓哪些 AI（Claude Code、Antigravity、Codex）參與討論與接手工作，為每個 AI 選模型、推理強度與工作分配比例；同時顯示各自的剩餘額度。設定存在 `<專案>/.agora/config.json`，與 `agora parties` 指令共用。
 - **討論串**：列出專案的討論串與分派狀態；可新增討論串、發言、讓 AI 自動討論、分派工作、查看進度、收回。點一下開啟逐字稿預覽，AI 回覆時會即時更新。
+- **內建子代理**：每個 AI 的卡片可以設定被 Agora 呼叫時能否啟動自己的內建子代理（Claude 禁用 Task 工具、Antigravity 由 hook 擋下、Codex 只能在提示中要求）。
+- **安裝狀態**：面板依 `agora install --status` 顯示此專案缺少或過期的項目，並提供「安裝到此專案」或「更新」。
 - **編輯器上下文**：發言或輸入工作單時，可附上目前編輯器的上下文：相對路徑、選取的行號與內容（沒有選取時為整份檔案）、語言、文件版本、是否未儲存，以及選取範圍優先的診斷（最多 10 筆）。
   沒有選取而檔案太大時，會請你先選取範圍，或只附路徑與診斷，不會默默截斷。
 - **總結**：討論串右鍵「產出討論總結」，選一方開新的對話讀完整逐字稿，產出共識、取捨、異議與工作單（`summary.md`）。
@@ -23,7 +25,7 @@
 只需要 Python 3.9 以上與這個擴充套件：
 
 ```bash
-code --install-extension agora-0.2.2.vsix     # 從 GitHub Release 下載
+code --install-extension agora-0.2.3.vsix     # 從 GitHub Release 下載
 ```
 
 擴充套件內建 Agora 核心（`agora.py`、`agoralib`、skills），啟動時同步到 `~/.agora/core`。

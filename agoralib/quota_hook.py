@@ -4,6 +4,7 @@
   python <agora>/agoralib/quota_hook.py claude-prompt   # Claude Code UserPromptSubmit：每次都附一行額度
   python <agora>/agoralib/quota_hook.py claude-tool     # Claude Code PostToolUse：只在需要交接/停工時提醒
   python <agora>/agoralib/quota_hook.py agy-pre         # Antigravity PreInvocation：首次呼叫附額度，需要時提醒
+  python <agora>/agoralib/quota_hook.py agy-tool        # Antigravity PreToolUse（子代理工具）：Agora 設定不允許時擋下
 
 只讀檔案、不做網路請求，確保 hook 本身很快；快取過期時另開背景程序更新。
 """
@@ -76,6 +77,12 @@ def project_parties() -> list:
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "claude-prompt"
+    if mode == "agy-tool":
+        # 只有被 Agora 呼叫、且此專案設定不允許內建子代理時（環境變數 AGORA_SUBAGENTS=0）才擋；使用者自己開的不受影響
+        out = ({"decision": "deny", "reason": "使用者設定這次不允許啟動內建子代理，請改用自己的工具完成。"}
+               if os.getenv("AGORA_SUBAGENTS") == "0" else {"decision": "allow"})
+        sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+        return
     (quota.AGORA_HOME / f"last_hook_{mode}").touch()  # 診斷用：確認 hook 有在執行
     if os.getenv(quota.PROBE_ENV):
         print("{}")
