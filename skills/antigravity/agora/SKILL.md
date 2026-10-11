@@ -1,6 +1,6 @@
 ---
 name: agora
-description: 透過 Agora 與 Claude Code、Codex 進行多輪技術討論、分派工作，或接續其他 AI 發起的討論串。當使用者要求「跟 Claude／Codex 討論」「問問其他 AI」「讓你們討論」「分工完成」或提到 Agora 討論串時使用。
+description: 透過 Agora 與 Claude Code、Codex 進行多輪技術討論、分派工作，或接續其他 AI 發起的討論串。當使用者要求「跟 Claude／Codex 討論」「問問其他 AI」「你們三個討論」「讓你們討論」「分工完成」或提到 Agora 討論串時使用。Claude Code 與 Codex 只能透過 Agora 聯絡，不要改用自己的 subagent 模擬它們的意見。
 ---
 
 # Agora：與 Claude Code、Codex 討論與分工

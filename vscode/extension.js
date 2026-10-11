@@ -404,9 +404,9 @@ class Model {
     this.onDidChange = this.emitter.event;
   }
 
+  /** 安裝狀態（agora parties --json 的 install）：installed / outdated / partial / missing；只有設定檔不算安裝 */
   installed() {
-    const ws = workspaceRoot();
-    return !!ws && fs.existsSync(path.join(ws, ".agora", "config.json"));
+    return !!this.install && ["installed", "outdated"].includes(this.install.state);
   }
 
   enabled() {
@@ -428,6 +428,7 @@ class Model {
     this.work = data.work || {};
     this.shareDays = data.share_days || 7;
     this.summarizer = data.summarizer || null;
+    this.install = data.install || null;
   }
 
   async loadVersion() {
@@ -473,7 +474,7 @@ class Model {
     return {
       workspace: workspaceRoot(),
       agoraFound: !!agoraCommand(),
-      installed: this.installed(),
+      install: this.install,
       parties: this.parties,
       work: this.work,
       shareDays: this.shareDays,
@@ -677,6 +678,7 @@ function activate(context) {
   });
 
   command("agora.newThread", async () => {
+    await model.loadParties();
     if (!model.installed()) {
       const go = await vscode.window.showWarningMessage("此專案尚未安裝 Agora，要先安裝嗎？", "安裝", "直接建立");
       if (!go) return;
@@ -684,7 +686,6 @@ function activate(context) {
     }
     const topic = await vscode.window.showInputBox({ prompt: "討論主題", ignoreFocusOut: true });
     if (!topic || !topic.trim()) return;
-    await model.loadParties();
     let parties = model.enabled();
     if (parties.length > 1) {
       const picked = await vscode.window.showQuickPick(

@@ -948,7 +948,8 @@ def cmd_parties(ws: Workspace, args):
     work = shares.recent_work(ws.root)
     if args.json:
         print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
-                          "share_days": shares.SHARE_DAYS, "summarizer": ws.config().get("summarizer")},
+                          "share_days": shares.SHARE_DAYS, "summarizer": ws.config().get("summarizer"),
+                          "install": install_status(ws)},
                          ensure_ascii=False, indent=2))
         return
     total = sum(s["share"] for s in settings.values() if s["enabled"])
@@ -1131,13 +1132,89 @@ def _merge_json(path: Path, update) -> dict:
 SKILL_ROOT = "D:/github/agora"   # skills 範本裡的 Agora 位置，install 時換成實際位置或 agora 指令
 
 
-def cmd_install(ws: Workspace, args):
-    """把 Agora 裝進工作區：啟用中各 AI 的使用說明、額度 hook、Antigravity 指令權限、.gitignore、預設設定"""
-    import shutil
+SKILL_DIRS = (("claude", Path(".claude") / "skills"), ("antigravity", Path(".agents") / "skills"))
+
+
+def install_plan() -> dict:
+    """install 要寫入的指令：hook、舊式路徑指令、給 AI 用的指令（有 editable 的 agora 時用它）"""
     root = AGORA_ROOT_DIR
-    hook = f"python {quote_path((root / 'agoralib' / 'quota_hook.py').as_posix())}"
     legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
-    cmd = agora_cmd() if agora_cmd() == "agora" else legacy   # skills 與權限裡給 AI 用的指令
+    return {"root": root, "legacy": legacy,
+            "hook": f"python {quote_path((root / 'agoralib' / 'quota_hook.py').as_posix())}",
+            "cmd": agora_cmd() if agora_cmd() == "agora" else legacy}
+
+
+def render_template(plan: dict, *parts: str) -> str:
+    """skills 範本換成實際的指令與位置"""
+    content = (plan["root"] / "skills" / Path(*parts)).read_text(encoding="utf-8")
+    return content.replace(f"python {SKILL_ROOT}/agora.py", plan["cmd"]).replace(SKILL_ROOT, plan["root"].as_posix())
+
+
+def _hook_commands(path: Path, collect) -> List[str]:
+    try:
+        return collect(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def install_status(ws: Workspace) -> dict:
+    """此工作區的安裝狀態：參與中各 AI 需要的 skills、hook、AGENTS.md 段落是否存在、是否為目前版本。
+    只有 .agora/config.json（例如在面板調整過設定）不算安裝。"""
+    plan = install_plan()
+    enabled = ws.enabled()
+    missing, outdated, checked = [], [], []
+
+    def check(label: str, present: bool, current: bool):
+        checked.append(label)
+        if not present:
+            missing.append(label)
+        elif not current:
+            outdated.append(label)
+
+    for agent, rel in SKILL_DIRS:
+        if agent in enabled:
+            for skill in ("agora", "relay"):
+                path = ws.root / rel / skill / "SKILL.md"
+                check(f"{NAMES[agent]} skill「{skill}」", path.exists(),
+                      path.exists() and path.read_text(encoding="utf-8") == render_template(plan, agent, skill, "SKILL.md"))
+    if "codex" in enabled:
+        agents_md = ws.root / "AGENTS.md"
+        text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+        section = render_template(plan, "codex", "AGENTS.md").strip()
+        check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, section in text)
+    if "claude" in enabled:
+        commands = _hook_commands(ws.root / ".claude" / "settings.local.json", lambda d: [
+            h.get("command", "") for groups in (d.get("hooks") or {}).values() for g in groups for h in g.get("hooks", [])])
+        check("Claude 額度 hook", any("quota_hook.py" in c for c in commands),
+              f"{plan['hook']} claude-prompt" in commands and f"{plan['hook']} claude-tool" in commands)
+    if "antigravity" in enabled:
+        commands = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
+            h.get("command", "") for h in ((d.get("agora-quota") or {}).get("PreInvocation") or [])])
+        check("Antigravity 額度 hook", bool(commands), f"{plan['hook']} agy-pre" in commands)
+    present = len(checked) - len(missing)
+    state = ("installed" if not missing and not outdated else "outdated" if not missing
+             else "partial" if present else "missing")
+    return {"state": state, "missing": missing, "outdated": outdated, "version": __version__}
+
+
+def cmd_install(ws: Workspace, args):
+    """把 Agora 裝進工作區：啟用中各 AI 的使用說明、額度 hook、Antigravity 指令權限、git 排除、預設設定"""
+    if getattr(args, "status", False):
+        status = install_status(ws)
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            return
+        print({"installed": "已安裝（目前版本）", "outdated": "已安裝，但有項目是舊版",
+               "partial": "只裝了一部分", "missing": "尚未安裝"}[status["state"]] + f"（Agora {__version__}）")
+        for label in status["missing"]:
+            print(f"  缺少：{label}")
+        for label in status["outdated"]:
+            print(f"  舊版：{label}")
+        if status["state"] != "installed":
+            print("執行 agora install 安裝或更新。")
+        return
+    plan = install_plan()
+    root, hook, legacy, cmd = plan["root"], plan["hook"], plan["legacy"], plan["cmd"]
     done = []
 
     config_file = config.config_path(ws.root)
@@ -1146,15 +1223,14 @@ def cmd_install(ws: Workspace, args):
         done.append(f"預設設定 → {config_file}（用 agora parties 或 VSCode 擴充套件選擇參與的 AI）")
     enabled = ws.enabled()
 
-    for agent, dest in (("claude", ws.root / ".claude" / "skills"), ("antigravity", ws.root / ".agents" / "skills")):
+    for agent, rel in SKILL_DIRS:
         if agent not in enabled:
             continue
+        dest = ws.root / rel
         for skill in ("agora", "relay"):
             target = dest / skill
             target.mkdir(parents=True, exist_ok=True)
-            content = (root / "skills" / agent / skill / "SKILL.md").read_text(encoding="utf-8")
-            content = content.replace(f"python {SKILL_ROOT}/agora.py", cmd).replace(SKILL_ROOT, root.as_posix())
-            (target / "SKILL.md").write_text(content, encoding="utf-8")
+            (target / "SKILL.md").write_text(render_template(plan, agent, skill, "SKILL.md"), encoding="utf-8")
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
@@ -1162,8 +1238,7 @@ def cmd_install(ws: Workspace, args):
     if "codex" in enabled:
         agents_md = ws.root / "AGENTS.md"
         created_agents_md = not agents_md.exists()
-        section = (root / "skills" / "codex" / "AGENTS.md").read_text(encoding="utf-8").strip()
-        section = section.replace(f"python {SKILL_ROOT}/agora.py", cmd).replace(SKILL_ROOT, root.as_posix())
+        section = render_template(plan, "codex", "AGENTS.md").strip()
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
         text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
             if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
@@ -1393,7 +1468,9 @@ def main(argv=None):
     p.add_argument("--off", action="store_true")
     p.set_defaults(func=cmd_keep)
 
-    p = sub.add_parser("install", help="把 Agora 裝進工作區（啟用中 AI 的 skills、hooks、權限、.gitignore）")
+    p = sub.add_parser("install", help="把 Agora 裝進工作區（啟用中 AI 的 skills、hooks、權限、git 排除）")
+    p.add_argument("--status", action="store_true", help="只檢查安裝狀態（缺少或舊版的項目），不寫入")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("_work", help=argparse.SUPPRESS)

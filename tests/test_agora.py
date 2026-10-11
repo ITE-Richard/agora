@@ -619,6 +619,26 @@ class TestInstall(unittest.TestCase):
             agents = (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(custom_root.as_posix(), agents)
 
+    def test_install_status(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            ws = cli.Workspace(Path(tmp))
+            config.update_parties(ws.root, models={"claude": "opus"})        # 只有設定檔（例如在面板改過模型）
+            self.assertEqual(cli.install_status(ws)["state"], "missing")
+            with patch.object(Path, "home", return_value=Path(home)):
+                cli.cmd_install(ws, None)
+            self.assertEqual(cli.install_status(ws), {**cli.install_status(ws), "state": "installed",
+                                                      "missing": [], "outdated": []})
+            skill = ws.root / ".claude" / "skills" / "agora" / "SKILL.md"
+            skill.write_text("舊版內容", encoding="utf-8")
+            status = cli.install_status(ws)
+            self.assertEqual((status["state"], status["outdated"]), ("outdated", ["Claude Code skill「agora」"]))
+            (ws.root / ".agents" / "hooks.json").unlink()
+            self.assertEqual(cli.install_status(ws)["state"], "partial")
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_install(ws, type("Args", (), {"status": True, "json": True})())
+            self.assertIn("Antigravity 額度 hook", json.loads(out.getvalue())["missing"])
+
     def test_install_quotes_agora_path_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home, \
                 tempfile.TemporaryDirectory() as parent:

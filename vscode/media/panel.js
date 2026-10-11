@@ -159,10 +159,16 @@
       children.push(el("div", { class: "notice" }, "找不到 Agora。請執行 pip install -e <Agora 資料夾>，或在設定中指定 agora.root。",
         el("button", { onclick: () => vscode.postMessage({ type: "settings" }) }, "開啟設定")));
     } else {
-      if (!state.installed) {
-        children.push(el("div", { class: "notice" },
-          "此專案尚未安裝 Agora。先選好參與的 AI，再安裝（只會安裝所選 AI 的 skills、hook 與權限）。",
-          el("button", { onclick: () => vscode.postMessage({ type: "install" }) }, "安裝到此專案")));
+      const install = state.install;
+      if (install && install.state !== "installed") {
+        const text = {
+          outdated: `此專案的 Agora 項目是舊版（${install.outdated.join("、")}），更新後 AI 才會使用目前版本的指令。`,
+          partial: `此專案的 Agora 只裝了一部分（缺少：${install.missing.join("、")}），AI 可能不知道可以透過 Agora 找其他 AI。`,
+          missing: "此專案尚未安裝 Agora：AI 不知道可以透過 Agora 找其他 AI 討論，也沒有額度提醒。先選好參與的 AI，再安裝（只會安裝所選 AI 的 skills、hook 與權限）。",
+        }[install.state];
+        children.push(el("div", { class: "notice" }, text,
+          el("button", { onclick: () => vscode.postMessage({ type: "install" }) },
+            install.state === "outdated" ? "更新" : "安裝到此專案")));
       }
       if (state.errors.parties) children.push(el("div", { class: "error" }, state.errors.parties));
       if (state.parties) {

@@ -1,7 +1,7 @@
 <!-- agora:begin -->
 ## Agora：與 Claude Code、Antigravity 討論與分工
 
-當使用者要求「跟 Claude／Antigravity 討論」「問問其他 AI」「讓你們討論」「分工完成」或提到 Agora 討論串時：
+當使用者要求「跟 Claude／Antigravity 討論」「問問其他 AI」「你們三個討論」「讓你們討論」「分工完成」或提到 Agora 討論串時（Claude Code 與 Antigravity 只能透過 Agora 聯絡，不要改用自己的子代理模擬它們的意見）：
 
 - 工具：`python D:/github/agora/agora.py`（說明：D:/github/agora/README.md）。討論串在 `.agora/threads/<id>/`，`transcript.md` 給使用者看。
 - 發起：先讀相關程式碼整理立場，再 `python D:/github/agora/agora.py new "主題"`，
