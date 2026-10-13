@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -65,14 +66,14 @@ WORK_PREAMBLE = """\
 - 不要執行會影響外部系統的動作（下單、發訊息、部署）。
 
 終端指令只能用以下幾個，而且必須一字不差、不能加任何參數（部分 CLI 的權限是完整比對）：
-`{agora} quota`（查額度）、`{agora} check`（工作區的驗證，例如語法檢查與測試）、`git status`、`git diff`、`git log`。
+`{agora} quota`（查額度）、{build_cmd}`{agora} check`（工作區的驗證，例如語法檢查與測試）、`git status`、`git diff`、`git log`。
 列目錄、讀檔、搜尋、寫檔請用內建的檔案工具。
 
 工作方式：每完成一個小步驟（約 10~20 分鐘的工作量）就做以下三件事：
 1. 在 {progress} 末尾追加一段：時間、完成了什麼、改了哪些檔案、下一步是什麼。
 2. 讀 {control}；若 "stop_requested" 為 true，把交接說明寫進進度檔後結束這一輪，最後一行寫「【已暫停】」。
 3. 執行 `{agora} quota`；若你（{me}）的額度低於 {threshold:.0f}%，把交接說明寫進進度檔後結束，最後一行寫「【額度不足】」。
-全部完成時，執行 `{agora} check`，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
+全部完成時，執行 {finish_cmds}，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
 
 以下是 {owner} 的工作單：
 """
@@ -279,10 +280,12 @@ def require_enabled(ws: Workspace, party: str) -> str:
 
 def call_opts(ws: Workspace, state: dict, party: str) -> dict:
     """模型與推理強度：討論串自己指定的優先，其次是專案設定，都沒有就用 CLI 預設；
-    能否啟動內建子代理只看專案設定"""
+    沙箱、額外可寫目錄、能否啟動內建子代理只看專案設定"""
     info = state["parties"].get(party) or {}
     settings = config.party_settings(ws.root)[party]
-    return {**{f: info.get(f) or settings.get(f) for f in config.FIELDS}, "subagents": settings["subagents"]}
+    return {**{f: info.get(f) or settings.get(f) for f in config.FIELDS},
+            "sandbox": settings["sandbox"], "subagents": settings["subagents"],
+            "add_dirs": ws.config().get("add_dirs") or []}
 
 
 # ───────────────────────── 討論 ─────────────────────────
@@ -751,6 +754,64 @@ def sleep_until(thread: Path, ts: float) -> bool:
     return True
 
 
+GUARDED_KEYS = ("build", "check", "add_dirs")
+
+
+def guarded_settings(data: dict) -> dict:
+    """接手方不能自己改的設定：會影響它能執行的指令（build、check）與能寫的範圍（add_dirs、沙箱）"""
+    return {**{k: data.get(k) for k in GUARDED_KEYS},
+            "sandbox": {p: item["sandbox"] for p, item in (data.get("parties") or {}).items()
+                        if isinstance(item, dict) and item.get("sandbox")}}
+
+
+def read_config_text(root: Path) -> Optional[str]:
+    try:
+        return config.config_path(root).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def guard_config(root: Path, original: Optional[str], thread: Path, worker: str) -> bool:
+    """接手一輪結束後，受保護的設定被改動就還原；其他設定（例如期間在面板調整的模型）保留"""
+    current = read_config_text(root)
+    if current == original:
+        return False
+
+    def parse(text):
+        try:
+            data = json.loads(text) if text is not None else {}
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    before = parse(original)
+    after = parse(current) if current is not None else None
+    if before is None or (after is not None and guarded_settings(after) == guarded_settings(before)):
+        return False
+    path = config.config_path(root)
+    if after is None:   # 被刪除或改成無法解析：整個檔案還原
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(original, encoding="utf-8")
+    else:
+        for k in GUARDED_KEYS:
+            if k in before:
+                after[k] = before[k]
+            else:
+                after.pop(k, None)
+        old_sandbox = guarded_settings(before)["sandbox"]
+        for item in (after.get("parties") or {}).values():
+            if isinstance(item, dict):
+                item.pop("sandbox", None)
+        for p, value in old_sandbox.items():
+            after.setdefault("parties", {}).setdefault(p, {})["sandbox"] = value
+        config.save(root, after)
+    add_system_note(thread, f"⚠️ {NAMES[worker]} 這輪改動了 .agora/config.json 的 build／check／add_dirs／沙箱設定，已還原。"
+                            f"這些設定只能由 {NAMES[HUMAN]} 調整；若是 {NAMES[HUMAN]} 在這段期間自己改的，請再設定一次。")
+    return True
+
+
 def cmd_work(ws: Workspace, args):
     """背景接手程序（由 assign 啟動）"""
     thread = ws.resolve_thread(args.thread)
@@ -781,6 +842,10 @@ def cmd_work(ws: Workspace, args):
         fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root,
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
                    agora=agora_cmd())
+        has_build = bool(ws.config().get("build"))
+        fmt.update(build_cmd=f"`{fmt['agora']} build`（建置專案）、" if has_build else "",
+                   finish_cmds=(f"`{fmt['agora']} build` 與 `{fmt['agora']} check`" if has_build
+                                else f"`{fmt['agora']} check`"))
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
             if relay["rounds"] == 0:
@@ -792,11 +857,13 @@ def cmd_work(ws: Workspace, args):
         before = git_status(ws.root)
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
+        config_before = read_config_text(ws.root)
         try:
             reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), call_opts(ws, state, worker),
                                                       True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
+            guard_config(ws.root, config_before, thread, worker)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
@@ -827,6 +894,7 @@ def cmd_work(ws: Workspace, args):
             remember_session(state, worker, session_id, session_id == relay.get("external_session"))
             save_state(thread, state)
         shares.record(ws.root, worker, thread.name)
+        guard_config(ws.root, config_before, thread, worker)
         if before != changed:
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
 
@@ -873,10 +941,54 @@ def cmd_recall(ws: Workspace, args):
 # ───────────────────────── 其他 ─────────────────────────
 
 DEFAULT_CHECK = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
+
+
+def run_configured_command(spec, cwd: Path) -> subprocess.CompletedProcess:
+    """執行 .agora/config.json 設定的指令：字串交給 shell；字串清單直接執行（不經 shell，
+    Windows 上先找出 .exe/.cmd 的完整路徑）；清單的清單依序執行，遇到失敗就停"""
+    kw = dict(cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if isinstance(spec, str):
+        return subprocess.run(spec, shell=True, **kw)
+    if isinstance(spec, list) and spec and all(isinstance(x, list) for x in spec):
+        outputs, proc = [], None
+        for sub in spec:
+            proc = run_configured_command(sub, cwd)
+            outputs.append((proc.stdout + proc.stderr).strip())
+            if proc.returncode:
+                break
+        return subprocess.CompletedProcess(spec, proc.returncode, "\n".join(filter(None, outputs)), "")
+    if isinstance(spec, list) and spec and not any(isinstance(x, (list, dict)) for x in spec):
+        args = [str(x) for x in spec]
+        exe = shutil.which(args[0]) or args[0]
+        try:
+            return subprocess.run([exe, *args[1:]], **kw)
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(spec, 127, "", f"找不到指令：{args[0]}")
+    raise ValueError(f"無效的指令格式：{spec!r}（要是字串、字串清單，或字串清單的清單）")
+
+
+def command_label(spec) -> str:
+    return spec if isinstance(spec, str) else json.dumps(spec, ensure_ascii=False)
+
+
+def cmd_build(ws: Workspace, args):
+    """專案建置：執行 .agora/config.json 的 build 指令"""
+    build = ws.config().get("build")
+    if not build:
+        sys.exit("未設定 build 指令。可在 .agora/config.json 加入 \"build\"（例如 \"west build\" 或 [\"make\"]）。")
+    try:
+        proc = run_configured_command(build, ws.root)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"建置指令：{command_label(build)}（exit={proc.returncode}）")
+    print((proc.stdout + proc.stderr).strip()[-3000:])
+    sys.exit(1 if proc.returncode else 0)
 
 
 def cmd_check(ws: Workspace, args):
-    """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令（預設 unittest）"""
+    """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
+    （沒設定時，有 tests/ 才跑 unittest）。建置另用 agora build"""
     import py_compile
     files = subprocess.run(["git", "ls-files", "*.py"], cwd=ws.root, capture_output=True, text=True,
                            encoding="utf-8").stdout.split()
@@ -888,11 +1000,18 @@ def cmd_check(ws: Workspace, args):
             py_compile.compile(str(ws.root / f), doraise=True)
         except py_compile.PyCompileError as e:
             errors.append(str(e))
-    print(f"語法檢查：{len(files)} 個檔案，{len(errors)} 個錯誤")
+    if files:
+        print(f"語法檢查：{len(files)} 個檔案，{len(errors)} 個錯誤")
     for e in errors:
         print(e)
-    check = ws.config().get("check") or DEFAULT_CHECK
-    proc = subprocess.run(check, cwd=ws.root, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    check = ws.config().get("check") or (DEFAULT_CHECK if (ws.root / "tests").is_dir() else None)
+    if not check:
+        print("未設定 check 指令，也沒有 tests/ 資料夾，略過測試。")
+        sys.exit(1 if errors else 0)
+    try:
+        proc = run_configured_command(check, ws.root)
+    except ValueError as e:
+        sys.exit(str(e))
     keep, in_failure = [], False
     for line in proc.stderr.splitlines() + proc.stdout.splitlines():
         if line.startswith(("ERROR:", "FAIL:")):
@@ -901,7 +1020,7 @@ def cmd_check(ws: Workspace, args):
             in_failure = False
         if in_failure or line.startswith(("Ran ", "OK", "FAILED")):
             keep.append(line)
-    print(f"驗證指令：{' '.join(check)}（exit={proc.returncode}）")
+    print(f"驗證指令：{command_label(check)}（exit={proc.returncode}）")
     print("\n".join(keep[-120:]) or (proc.stdout + proc.stderr)[-3000:])
     sys.exit(1 if errors or proc.returncode else 0)
 
@@ -939,10 +1058,11 @@ def cmd_parties(ws: Workspace, args):
         sys.exit(f"未知的 AI：{bad}，可用：{list(AI_PARTIES)}")
     models_, efforts, shares_ = parse_pairs(args.model), parse_pairs(args.effort), parse_pairs(args.share)
     subagents = parse_pairs(args.subagents)
-    if enable or disable or models_ or efforts or shares_ or subagents:
+    sandboxes = parse_pairs(args.sandbox)
+    if enable or disable or models_ or efforts or shares_ or subagents or sandboxes:
         guard_nested()
         try:
-            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents)
+            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents, sandboxes)
         except ValueError as e:
             sys.exit(str(e))
     else:
@@ -965,6 +1085,8 @@ def cmd_parties(ws: Workspace, args):
             actual = f"{int(work.get(p, 0) / done * 100 + 0.5)}%" if done else "-"
             line += f"｜分配比例 {s['share']}（目標 {target}，近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪 {actual}）"
             line += f"｜內建子代理：{'允許' if s['subagents'] else '不允許'}"
+            if s.get("sandbox"):
+                line += f"｜沙箱：{s['sandbox']}"
         print(line)
 
 
@@ -1201,6 +1323,10 @@ def install_status(ws: Workspace) -> dict:
             for h in g.get("hooks", [])])
         check("Antigravity 子代理開關 hook", bool(matchers),
               sorted(matchers) == sorted((t, f"{plan['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
+        if commands:   # 指令權限是全域設定，不能用來判斷這個專案有沒有裝；裝過才比對是否缺了新的指令
+            allow = _hook_commands(Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
+                                   lambda d: (d.get("permissions") or {}).get("allow") or [])
+            check("Antigravity 指令權限", True, all(f"command({plan['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
@@ -1282,7 +1408,7 @@ def cmd_install(ws: Workspace, args):
         old = {f"write_file({ws.root})", f"write_file({ws.root.as_posix()})"}
         allow[:] = [rule for rule in allow if rule not in old]
         cmds = list(dict.fromkeys([cmd, legacy]))   # 舊的路徑指令也保留，已裝過的 skills 仍可用
-        for rule in (*[f"command({c} {sub})" for c in cmds for sub in ("quota", "check")], "command(git status)",
+        for rule in (*[f"command({c} {sub})" for c in cmds for sub in AGENT_COMMANDS], "command(git status)",
                      "command(git diff)", "command(git log)",
                      f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:
@@ -1433,7 +1559,10 @@ def main(argv=None):
     p.add_argument("thread")
     p.set_defaults(func=cmd_recall)
 
-    p = sub.add_parser("check", help="工作區驗證（語法檢查＋.agora/config.json 的 check 指令）")
+    p = sub.add_parser("build", help="專案建置（執行 .agora/config.json 的 build 指令）")
+    p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("check", help="工作區驗證（語法檢查＋.agora/config.json 的 check 指令；建置另用 build）")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("quota", help="三方剩餘額度")
@@ -1450,6 +1579,9 @@ def main(argv=None):
                    help="自動分派的工作比例，例如 --share claude=5 --share codex=3；0 表示不自動分派給它，default 改回 1")
     p.add_argument("--subagents", action="append",
                    help="被 Agora 呼叫時能否啟動自己的內建子代理，例如 --subagents claude=off（on / off，預設 on）")
+    p.add_argument("--sandbox", action="append",
+                   help="Codex 接手工作時的沙箱，例如 --sandbox codex=danger-full-access"
+                        "（workspace-write / danger-full-access / read-only，default 改回 workspace-write；討論一律唯讀）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_parties)
 

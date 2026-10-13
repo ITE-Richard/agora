@@ -43,6 +43,7 @@ $A parties                                          # 此專案參與的 AI 與�
 $A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
 $A parties --share claude=5 --share codex=3          # 自動分派的工作比例
 $A parties --subagents codex=off                    # 被 Agora 呼叫時能否啟動自己的內建子代理（on / off）
+$A parties --sandbox codex=danger-full-access       # Codex 接手工作時的沙箱（預設 workspace-write）
 $A models [--refresh]                               # 各 AI 可選的模型與推理強度
 $A new "主題" [--parties claude,codex] [--model codex=gpt-5] [--effort codex=high]
 $A send <id> --from claude --message "..."          # 預設依序請其他所有 AI 回覆
@@ -57,6 +58,7 @@ $A status <id> [--wait 900]                         # 分派狀態與最新進�
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A recall <id>                                      # 請接手方在下一個檢查點暫停
 $A check                                            # 工作區驗證（語法檢查＋測試）
+$A build                                            # 專案建置（.agora/config.json 的 build 指令）
 $A quota [--refresh] [--json]                       # 三方剩餘額度
 $A activity                                         # 所有進行中的討論與分派（誰正在回覆）
 $A wait <id>                                        # 接上背景進行中的討論，顯示回覆直到結束
@@ -142,14 +144,15 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 | | 討論 | 接手工作 |
 |---|---|---|
-| Claude Code | 禁用 Edit/Write | `acceptEdits`；Bash 只允許 `agora.py quota/check` 與唯讀 git |
+| Claude Code | 禁用 Edit/Write | `acceptEdits`；Bash 只允許 `agora.py quota/check/build` 與唯讀 git；不能改 `.agora/config.json` |
 | Antigravity | 沒有寫檔權限 | `--mode accept-edits`（只能寫工作區）；指令依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） |
-| Codex | `-s read-only` | `-s workspace-write`（只能寫工作區） |
+| Codex | `-s read-only`（不受沙箱設定影響） | `-s workspace-write`（預設，`add_dirs` 的目錄另外可寫）；可用 `agora parties --sandbox codex=danger-full-access` 改為完整存取 |
 
 - 分派時用暫時的 git index 替工作區拍快照，存在 `refs/agora/<討論串>`（不動使用者的 index 與工作區；被忽略的檔案與 `.env`、金鑰不進快照），`changes` 與 VSCode 的「檢視分派期間的變更」以它為基準；清理討論串時一併刪除。期間任何人的修改都會列出。
 - 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。
+- `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍，接手期間被改動會在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
-- Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`git status/diff/log`。
+- Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`agora.py build`、`git status/diff/log`。權限是全域設定，升級後新增的指令要重新 `install` 才會加入（安裝狀態會顯示為需要更新）。
 
 ## 設定
 
@@ -162,7 +165,15 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | `AGORA_QUOTA_THRESHOLD` | 5（%） |
 | `AGORA_AGY_POOL` | gemini（Antigravity 內 Gemini 與 Claude 模型是不同額度池） |
 
-工作區的 `.agora/config.json` 可設定 `summarizer`（`summarize` 沒給 `--by` 時的總結方，例如 `"claude"`）與 `check` 指令，例如 `{"check": ["python", "-m", "unittest", "discover", "-s", "tests"]}`；參與的 AI 與模型見上方。
+工作區的 `.agora/config.json` 可設定：
+
+- `summarizer`：`summarize` 沒給 `--by` 時的總結方，例如 `"claude"`。
+- `build`：`agora build` 執行的建置指令，例如 `"west build"`。有設定時，接手方完成工作前也會執行。
+- `check`：`agora check` 在語法檢查後執行的驗證指令，例如 `["python", "-m", "unittest", "discover", "-s", "tests"]`；沒設定時，有 `tests/` 資料夾才跑 unittest。`check` 不包含建置。
+- `add_dirs`：Codex 接手工作（workspace-write）時額外可寫的目錄，相對路徑以工作區為準，不存在的略過。
+
+`build`、`check` 寫成字串時交給 shell 執行；寫成字串清單時直接執行、不經 shell；寫成清單的清單時依序執行，遇到失敗就停。
+參與的 AI、模型與 Codex 的沙箱模式可用 `agora parties` 或 VSCode 面板調整。
 
 ## 專案結構
 

@@ -1,5 +1,6 @@
 """Agora 核心邏輯測試：不呼叫任何 AI CLI、不連網"""
 
+import argparse
 import io
 import json
 import os
@@ -519,7 +520,8 @@ class TestSubagents(unittest.TestCase):
             groups = hooks["agora-subagents"]["PreToolUse"]
             self.assertEqual({g["matcher"] for g in groups}, set(parties.AGY_SUBAGENT_TOOLS))
             self.assertTrue(all('"' not in h["command"] for g in groups for h in g["hooks"]))
-            self.assertEqual(cli.install_status(ws)["state"], "installed")
+            with patch.object(Path, "home", return_value=Path(home)):
+                self.assertEqual(cli.install_status(ws)["state"], "installed")
 
     @unittest.skipUnless(sys.platform.startswith("win"), "8.3 短路徑只在 Windows")
     def test_no_space_path_uses_short_name(self):
@@ -704,14 +706,23 @@ class TestInstall(unittest.TestCase):
             self.assertIn(custom_root.as_posix(), agents)
 
     def test_install_status(self):
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home,                 patch.object(Path, "home", return_value=Path(home)):
             ws = cli.Workspace(Path(tmp))
             config.update_parties(ws.root, models={"claude": "opus"})        # 只有設定檔（例如在面板改過模型）
             self.assertEqual(cli.install_status(ws)["state"], "missing")
-            with patch.object(Path, "home", return_value=Path(home)):
-                cli.cmd_install(ws, None)
+            cli.cmd_install(ws, None)
             self.assertEqual(cli.install_status(ws), {**cli.install_status(ws), "state": "installed",
                                                       "missing": [], "outdated": []})
+            # Antigravity 指令權限是全域設定：缺了新版的指令（例如 build）算需要更新
+            settings = Path(home) / ".gemini" / "antigravity-cli" / "settings.json"
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            full = list(data["permissions"]["allow"])
+            data["permissions"]["allow"] = [r for r in full if not r.endswith(" build)")]
+            settings.write_text(json.dumps(data), encoding="utf-8")
+            status = cli.install_status(ws)
+            self.assertEqual((status["state"], status["outdated"]), ("outdated", ["Antigravity 指令權限"]))
+            data["permissions"]["allow"] = full
+            settings.write_text(json.dumps(data), encoding="utf-8")
             skill = ws.root / ".claude" / "skills" / "agora" / "SKILL.md"
             skill.write_text("舊版內容", encoding="utf-8")
             status = cli.install_status(ws)
@@ -773,8 +784,8 @@ class TestPartySettings(unittest.TestCase):
             config.update_parties(ws.root, models={"codex": "proj-model", "claude": "opus"}, efforts={"codex": "low"})
             s = state_with(["claude", "codex"])
             s["parties"]["codex"]["model"] = "thread-model"
-            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low", "subagents": True})
-            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None, "subagents": True})
+            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low", "sandbox": None, "subagents": True, "add_dirs": []})
+            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None, "sandbox": None, "subagents": True, "add_dirs": []})
 
     def test_disabled_party_is_not_asked_to_reply(self):
         s = state_with(["claude", "antigravity", "codex"])
@@ -1066,12 +1077,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.3")
+        self.assertEqual(__version__, "0.2.4")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.3", out.getvalue())
+        self.assertIn("0.2.4", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1130,6 +1141,127 @@ class TestQuotaWindows(unittest.TestCase):
         u2 = {"remaining_pct": 100.0, "resets_at": now + 3600, "updated_at": now}
         self.assertNotIn("，重置", quota.describe("Antigravity", u2))
         self.assertIn("100%", quota.describe("Antigravity", u2))
+
+
+class TestBuildAndSandbox(unittest.TestCase):
+    def run_cmd(self, func, ws):
+        out = io.StringIO()
+        with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
+            func(ws, argparse.Namespace())
+        return cm.exception.code, out.getvalue()
+
+    def test_run_configured_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            proc = cli.run_configured_command([sys.executable, "-c", "print('hello_world')"], cwd)
+            self.assertEqual((proc.returncode, proc.stdout.strip()), (0, "hello_world"))
+            # 清單不經 shell：參數裡的 & 原樣傳給程式
+            proc = cli.run_configured_command([sys.executable, "-c", "import sys; print(sys.argv[1])", "a&b"], cwd)
+            self.assertEqual(proc.stdout.strip(), "a&b")
+            # 清單的清單依序執行，遇到失敗就停
+            proc = cli.run_configured_command([[sys.executable, "-c", "print('one')"],
+                                               [sys.executable, "-c", "import sys; sys.exit(3)"],
+                                               [sys.executable, "-c", "print('never')"]], cwd)
+            self.assertEqual(proc.returncode, 3)
+            self.assertIn("one", proc.stdout)
+            self.assertNotIn("never", proc.stdout)
+            self.assertEqual(cli.run_configured_command(["no-such-command-agora"], cwd).returncode, 127)
+            with self.assertRaises(ValueError):
+                cli.run_configured_command([["a"], "b"], cwd)
+
+    def test_build_and_check_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            self.assertIn("未設定 build", str(self.run_cmd(cli.cmd_build, ws)[0]))
+            config.save(ws.root, {"build": [sys.executable, "-c", "print('BUILD_OK')"],
+                                  "check": [sys.executable, "-c", "print('CHECK_OK')"]})
+            code, out = self.run_cmd(cli.cmd_build, ws)
+            self.assertEqual(code, 0)
+            self.assertIn("BUILD_OK", out)
+            code, out = self.run_cmd(cli.cmd_check, ws)
+            self.assertEqual(code, 0)
+            self.assertIn("CHECK_OK", out)
+            self.assertNotIn("BUILD_OK", out)
+            config.save(ws.root, {"build": [sys.executable, "-c", "import sys; sys.exit(2)"]})
+            self.assertEqual(self.run_cmd(cli.cmd_build, ws)[0], 1)
+
+    def test_check_without_tests_dir_skips_unittest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            code, out = self.run_cmd(cli.cmd_check, ws)
+            self.assertEqual(code, 0)
+            self.assertIn("略過測試", out)
+
+    def test_sandbox_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = config.update_parties(root, sandboxes={"codex": "danger-full-access"})
+            self.assertEqual(settings["codex"]["sandbox"], "danger-full-access")
+            self.assertIsNone(settings["claude"]["sandbox"])
+            self.assertIsNone(config.update_parties(root, sandboxes={"codex": "default"})["codex"]["sandbox"])
+            with self.assertRaises(ValueError):
+                config.update_parties(root, sandboxes={"codex": "invalid-sandbox"})
+            with self.assertRaises(ValueError):
+                config.update_parties(root, sandboxes={"claude": "danger-full-access"})
+            config.update_parties(root, models={"codex": "m"}, sandboxes={"codex": "danger-full-access"})
+            opts = cli.call_opts(cli.Workspace(root), state_with(["codex"]), "codex")
+            self.assertEqual(opts["sandbox"], "danger-full-access")
+            self.assertEqual("、".join(opts[f] for f in config.FIELDS if opts.get(f)), "m")   # 等待訊息不顯示沙箱
+
+    def codex_cmd(self, ws, opts, work):
+        called = {}
+
+        def fake_run(cmd, *args, **kwargs):
+            called["cmd"] = cmd
+            return [{"type": "thread.started", "thread_id": "th1"},
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "OK"}}], ""
+
+        with patch("agoralib.parties._run", side_effect=fake_run), \
+                patch("agoralib.quota.update_codex_snapshot_from_session"):
+            parties.call_codex("prompt", None, opts, work, ws, 30, ws)
+        cmd = called["cmd"]
+        return cmd[cmd.index("-s") + 1], [cmd[i + 1] for i, x in enumerate(cmd) if x == "--add-dir"]
+
+    def test_call_codex_sandbox_and_add_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "custom_dir").mkdir()
+            opts = {"add_dirs": ["custom_dir", "missing_dir"]}
+            self.assertEqual(self.codex_cmd(ws, opts, True), ("workspace-write", [str(ws / "custom_dir")]))
+            self.assertFalse((ws / "missing_dir").exists())          # 不存在的略過，不替使用者建立
+            self.assertFalse((ws / ".agents").exists())
+            # 討論與總結一律唯讀，不受沙箱設定影響
+            for sandbox in ("danger-full-access", "workspace-write", None):
+                self.assertEqual(self.codex_cmd(ws, {**opts, "sandbox": sandbox}, False), ("read-only", []))
+            self.assertEqual(self.codex_cmd(ws, {**opts, "sandbox": "danger-full-access"}, True),
+                             ("danger-full-access", []))
+
+    def test_guard_config_restores_protected_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, thread = Path(tmp), Path(tmp) / "thread"
+            thread.mkdir()
+            config.save(root, {"check": ["python", "-V"], "parties": {"codex": {"share": 2}}})
+            original = cli.read_config_text(root)
+            self.assertFalse(cli.guard_config(root, original, thread, "codex"))
+            # 接手方把自己改成完整存取、換掉 build；同時 Richard 在面板改了模型 → 只還原受保護的設定
+            config.save(root, {"check": ["python", "-V"], "build": "evil",
+                               "parties": {"codex": {"share": 2, "sandbox": "danger-full-access", "model": "m"}}})
+            self.assertTrue(cli.guard_config(root, original, thread, "codex"))
+            self.assertEqual(config.load(root), {"check": ["python", "-V"], "parties": {"codex": {"share": 2, "model": "m"}}})
+            self.assertIn("已還原", (thread / "transcript.md").read_text(encoding="utf-8"))
+            # 改成無法解析 → 整個檔案還原
+            config.config_path(root).write_text("{", encoding="utf-8")
+            self.assertTrue(cli.guard_config(root, original, thread, "codex"))
+            self.assertEqual(cli.read_config_text(root), original)
+            # 只改其他設定 → 不動
+            config.update_parties(root, models={"claude": "opus"})
+            self.assertFalse(cli.guard_config(root, original, thread, "codex"))
+
+    def test_work_preamble_mentions_build_only_when_configured(self):
+        fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",
+                   threshold=5, agora="agora")
+        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", finish_cmds="`agora check`")
+        self.assertNotIn("agora build", text)
 
 
 if __name__ == "__main__":

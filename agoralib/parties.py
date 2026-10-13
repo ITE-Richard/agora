@@ -324,8 +324,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         # 可改檔；Bash 只開放 Agora 的固定指令與唯讀 git，其餘在非互動模式下會被拒絕
         cmd += ["--permission-mode", "acceptEdits",
                 "--allowedTools", f"Bash({agora_cmd()} quota*)", f"Bash({agora_cmd()} check*)",
-                "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
-                "--disallowedTools", "Read(./.env)", "Edit(./.env)"]
+                f"Bash({agora_cmd()} build*)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
+                "--disallowedTools", "Read(./.env)", "Edit(./.env)", "Edit(./.agora/config.json)"]
     else:
         cmd += ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
     if not opts.get("subagents", True):
@@ -369,9 +369,15 @@ def codex_event(live: Live, e: dict):
 
 def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
-    # 討論唯讀；工作模式只能寫工作區（Codex 沙箱），不碰工作區外
-    sandbox = "workspace-write" if work else "read-only"
+    # 討論與總結一律唯讀；工作模式預設只能寫工作區（Codex 沙箱），可由專案設定改為其他模式
+    sandbox = (opts.get("sandbox") or "workspace-write") if work else "read-only"
     cmd = [quota.find_codex(), "exec", "--json", "-s", sandbox, "-C", str(workspace), "--skip-git-repo-check"]
+    if work and sandbox == "workspace-write":
+        # 專案設定的額外可寫目錄；不存在的略過，不替使用者建立
+        for extra in opts.get("add_dirs") or []:
+            d = workspace / extra
+            if d.is_dir():
+                cmd += ["--add-dir", str(d)]
     if opts.get("model"):
         cmd += ["-m", opts["model"]]
     if opts.get("effort"):

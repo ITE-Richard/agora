@@ -138,6 +138,19 @@
           el("span", { class: "share-text" }, setting.subagents !== false ? "允許" : `不允許 · ${SUBAGENT_OFF[p] || ""}`)));
     }
 
+    // Codex 接手工作時的沙箱（討論一律唯讀）：跑 west build 等需寫入工作區外快取時可設為完整存取
+    let sandboxRow = null;
+    if (!disabled && p === "codex") {
+      const sandboxOptions = [
+        { value: "", label: "只能寫工作區（workspace-write，預設）" },
+        { value: "danger-full-access", label: "完整存取（danger-full-access）" },
+        { value: "read-only", label: "唯讀（read-only）" },
+      ];
+      sandboxRow = el("label", { class: "row", title: "Codex 接手工作時的沙箱，討論一律唯讀；需執行 west build 等寫入工作區外快取／工具鏈的指令時請選完整存取" },
+        el("span", { class: "label" }, "接手沙箱"),
+        select(sandboxOptions, setting.sandbox === "workspace-write" ? "" : setting.sandbox || "", (v) => vscode.postMessage({ type: "set", party: p, field: "sandbox", value: v }), disabled));
+    }
+
     const quota = state.quota ? state.quota[p] : null;
     return el("section", { class: `card${disabled ? " disabled" : ""}` },
       el("label", { class: "head" },
@@ -152,6 +165,7 @@
       effortRow,
       shareRow,
       subagentRow,
+      sandboxRow,
       cat.error ? el("div", { class: "error" }, `⚠ ${cat.error}`) : null);
   }
 

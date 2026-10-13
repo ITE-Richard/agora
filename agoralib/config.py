@@ -2,19 +2,27 @@
 工作區設定：<工作區>/.agora/config.json
 
 {
+  "build": "west build",
   "check": ["python", "-m", "unittest", "discover", "-s", "tests"],
+  "add_dirs": ["../shared-cache"],
   "parties": {
     "claude":      {"enabled": true,  "model": "opus", "effort": "high", "share": 2, "subagents": false},
     "antigravity": {"enabled": false},
-    "codex":       {"enabled": true,  "model": "gpt-6.1-sol", "share": 1}
+    "codex":       {"enabled": true,  "model": "gpt-6.1-sol", "share": 1, "sandbox": "danger-full-access"}
   }
 }
+
+build / check 是 `agora build` / `agora check` 執行的指令：字串交給 shell，字串清單直接執行，清單的清單依序執行。
+check 沒設定時，有 tests/ 資料夾才跑 unittest。
+add_dirs 是 Codex 接手工作（workspace-write）時額外可寫的目錄，相對路徑以工作區為準，不存在的略過。
 
 parties 沒寫到的 AI 視為啟用、模型與推理強度沿用各 CLI 自己的預設。
 討論串可以另外指定模型（new --model），優先於這裡的設定。
 share 是自動挑選接手方時的工作分配比例（預設 1，0 表示不自動分派給它），見 shares.py。
 subagents 是被 Agora 呼叫時能否啟動自己的內建子代理（預設 true）：Claude Code 禁用 Task 工具；
 Antigravity 由 install 裝的 PreToolUse hook 擋下 invoke_subagent 等工具；Codex 目前無法強制關閉，只在提示中要求。
+sandbox 只有 Codex 能設定，是接手工作時的沙箱（預設 workspace-write）；討論與總結一律 read-only。
+build、check、add_dirs、sandbox 會影響接手方能執行的指令與能寫的範圍，接手期間被改動會被還原（見 cli.guard_config）。
 """
 
 import json
@@ -24,6 +32,8 @@ from typing import Dict, Iterable, List, Optional
 from agoralib.parties import AI_PARTIES
 
 FIELDS = ("model", "effort")
+SANDBOX_MODES = ("workspace-write", "danger-full-access", "read-only")
+SANDBOX_PARTIES = ("codex",)
 
 
 def config_path(root: Path) -> Path:
@@ -51,6 +61,8 @@ def party_settings(root: Path, data: Optional[dict] = None) -> Dict[str, dict]:
         share = item.get("share", 1)
         out[p] = {"enabled": item.get("enabled", True) is not False,
                   **{f: item.get(f) or None for f in FIELDS},
+                  "sandbox": item.get("sandbox") if p in SANDBOX_PARTIES and item.get("sandbox") in SANDBOX_MODES
+                  else None,
                   "share": share if isinstance(share, int) and share >= 0 else 1,
                   "subagents": item.get("subagents", True) is not False}
     return out
@@ -67,8 +79,9 @@ def shares(root: Path) -> Dict[str, int]:
 def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str] = (),
                    models: Optional[Dict[str, str]] = None, efforts: Optional[Dict[str, str]] = None,
                    shares: Optional[Dict[str, str]] = None,
-                   subagents: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
-    """更新參與方設定；模型或推理強度給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1，
+                   subagents: Optional[Dict[str, str]] = None,
+                   sandboxes: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
+    """更新參與方設定；模型、推理強度、沙箱給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1，
     子代理給 on / off（default 表示改回允許）。至少要保留一個 AI。"""
     data = load(root)
     parties = data.setdefault("parties", {})
@@ -81,6 +94,16 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
                 item[field] = value
             else:
                 item.pop(field, None)
+    for p, value in (sandboxes or {}).items():
+        if p not in SANDBOX_PARTIES:
+            raise ValueError(f"只有 {', '.join(SANDBOX_PARTIES)} 可以設定沙箱模式：{p}={value}")
+        item = parties.setdefault(p, {})
+        if value in ("", "default"):
+            item.pop("sandbox", None)
+        elif value in SANDBOX_MODES:
+            item["sandbox"] = value
+        else:
+            raise ValueError(f"沙箱模式設定只能是 {', '.join(SANDBOX_MODES)}：{p}={value}")
     for p, value in (shares or {}).items():
         item = parties.setdefault(p, {})
         if value in ("", "default"):

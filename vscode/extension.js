@@ -949,6 +949,15 @@ function activate(context) {
     model.loadQuota();
   });
 
+  command("agora.build", async () => {
+    try {
+      await runLong("執行建置", ["build"]);
+      vscode.window.showInformationMessage("Agora：建置完成。");
+    } finally {
+      output.show(true);
+    }
+  });
+
   command("agora.check", async () => {
     try {
       await runLong("執行驗證", ["check"]);

@@ -2,7 +2,7 @@
   "name": "agora",
   "displayName": "Agora",
   "description": "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論與分工：選擇參與的 AI 與模型、管理討論串、查看額度。",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "richard-jheng",
   "license": "UNLICENSED",
   "private": true,
@@ -113,6 +113,11 @@
       {
         "command": "agora.quota",
         "title": "查看三方額度",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.build",
+        "title": "執行專案建置",
         "category": "Agora"
       },
       {
