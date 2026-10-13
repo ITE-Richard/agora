@@ -29,7 +29,7 @@ from typing import List, Optional
 
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
-                              NESTED_ENV, CallError, Live, agora_cmd, canonical,
+                              LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
@@ -755,6 +755,7 @@ def sleep_until(thread: Path, ts: float) -> bool:
 
 
 GUARDED_KEYS = ("build", "check", "add_dirs")
+LOCKED_KEYS = ("build", "check")   # 接手當輪以環境變數帶給 agora build / check
 
 
 def guarded_settings(data: dict) -> dict:
@@ -842,7 +843,8 @@ def cmd_work(ws: Workspace, args):
         fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root,
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
                    agora=agora_cmd())
-        has_build = bool(ws.config().get("build"))
+        cfg = ws.config()
+        has_build = bool(cfg.get("build"))
         fmt.update(build_cmd=f"`{fmt['agora']} build`（建置專案）、" if has_build else "",
                    finish_cmds=(f"`{fmt['agora']} build` 與 `{fmt['agora']} check`" if has_build
                                 else f"`{fmt['agora']} check`"))
@@ -858,8 +860,11 @@ def cmd_work(ws: Workspace, args):
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
         config_before = read_config_text(ws.root)
+        opts = call_opts(ws, state, worker)
+        # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
+        opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
         try:
-            reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), call_opts(ws, state, worker),
+            reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), opts,
                                                       True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
@@ -972,9 +977,23 @@ def command_label(spec) -> str:
     return spec if isinstance(spec, str) else json.dumps(spec, ensure_ascii=False)
 
 
+def command_config(ws: Workspace) -> dict:
+    """build / check 指令的來源：接手工作時用 Agora 帶入的這輪開始時的設定（接手方改設定檔也不影響），否則讀設定檔"""
+    locked = os.getenv(LOCKED_ENV)
+    if locked is None:
+        return ws.config()
+    try:
+        data = json.loads(locked)
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        sys.exit(f"無法讀取 Agora 帶入的建置與驗證指令（{LOCKED_ENV}）。")
+    return data
+
+
 def cmd_build(ws: Workspace, args):
     """專案建置：執行 .agora/config.json 的 build 指令"""
-    build = ws.config().get("build")
+    build = command_config(ws).get("build")
     if not build:
         sys.exit("未設定 build 指令。可在 .agora/config.json 加入 \"build\"（例如 \"west build\" 或 [\"make\"]）。")
     try:
@@ -1004,7 +1023,7 @@ def cmd_check(ws: Workspace, args):
         print(f"語法檢查：{len(files)} 個檔案，{len(errors)} 個錯誤")
     for e in errors:
         print(e)
-    check = ws.config().get("check") or (DEFAULT_CHECK if (ws.root / "tests").is_dir() else None)
+    check = command_config(ws).get("check") or (DEFAULT_CHECK if (ws.root / "tests").is_dir() else None)
     if not check:
         print("未設定 check 指令，也沒有 tests/ 資料夾，略過測試。")
         sys.exit(1 if errors else 0)

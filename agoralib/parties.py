@@ -52,6 +52,7 @@ AGY_SUBAGENT_TOOLS = ("invoke_subagent", "define_subagent", "manage_subagents", 
 NO_SUBAGENT_NOTE = "（使用者設定：這次不要使用你內建的子代理工具（例如 spawn_agent），請自己完成。）\n\n"
 DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
+LOCKED_ENV = "AGORA_LOCKED_COMMANDS"   # 接手方執行 agora build / check 時用的指令（分派當輪開始時的設定）
 QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|429|resource_exhausted|credits", re.I)
 
 HUMAN = "human"
@@ -179,8 +180,10 @@ def describe_tool(name: str, params: dict, workspace: Path) -> str:
 def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
          on_event: Optional[Callable[[dict], None]] = None, extra_env: Optional[dict] = None) -> Tuple[list, str]:
     """執行 CLI，逐行解析 JSON 事件（on_event 即時處理）；逾時會終止整棵程序樹"""
-    env = {**os.environ, NESTED_ENV: "1", **(extra_env or {})}
+    env = dict(os.environ)
     env.pop("AGORA_JOB", None)   # AI 執行的 agora 指令（quota、check）不是背景討論程序
+    env.pop(LOCKED_ENV, None)    # 只有接手工作時由呼叫端明確帶入
+    env.update({NESTED_ENV: "1", **(extra_env or {})})
     proc = subprocess.Popen(cmd, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
     errors: list = []
@@ -226,6 +229,9 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
         timer.cancel()
     for w in workers:
         w.join(timeout=10)
+    proc.stdout.close()
+    if not workers[1].is_alive():   # 孫程序仍握著 stderr 時還在讀，此時關閉會卡住，交給 daemon 執行緒
+        proc.stderr.close()
     if expired.is_set():
         raise subprocess.TimeoutExpired(cmd, timeout + 60)
     stdout, stderr = "".join(lines), "".join(errors)
@@ -283,7 +289,7 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         if opts.get("effort"):
             cmd += ["--effort", opts["effort"]]
         events, stderr = _run(cmd, workspace, None, timeout, live and (lambda e: antigravity_event(live, e)),
-                              {SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
+                              {**(opts.get("env") or {}), SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
         reply = (result.get("response") or "").strip()
@@ -336,7 +342,7 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         cmd += ["--model", opts["model"]]
     if opts.get("effort"):
         cmd += ["--effort", opts["effort"]]
-    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: claude_event(live, e)))
+    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: claude_event(live, e)), opts.get("env"))
     for e in events:
         if e.get("type") == "rate_limit_event":
             quota.write_claude_snapshot(quota.windows_from_rate_limit_info(e.get("rate_limit_info") or {}), "agora")
@@ -388,7 +394,7 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
         cmd += ["--disable", "multi_agent"]
         prompt = NO_SUBAGENT_NOTE + prompt
     cmd += ["resume", session_id, "-"] if session_id else ["-"]
-    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: codex_event(live, e)))
+    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: codex_event(live, e)), opts.get("env"))
     thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), session_id)
     messages = [e["item"].get("text", "") for e in events
                 if e.get("type") == "item.completed" and (e.get("item") or {}).get("type") == "agent_message"]

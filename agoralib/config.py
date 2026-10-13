@@ -22,7 +22,8 @@ share 是自動挑選接手方時的工作分配比例（預設 1，0 表示不�
 subagents 是被 Agora 呼叫時能否啟動自己的內建子代理（預設 true）：Claude Code 禁用 Task 工具；
 Antigravity 由 install 裝的 PreToolUse hook 擋下 invoke_subagent 等工具；Codex 目前無法強制關閉，只在提示中要求。
 sandbox 只有 Codex 能設定，是接手工作時的沙箱（預設 workspace-write）；討論與總結一律 read-only。
-build、check、add_dirs、sandbox 會影響接手方能執行的指令與能寫的範圍，接手期間被改動會被還原（見 cli.guard_config）。
+build、check、add_dirs、sandbox 會影響接手方能執行的指令與能寫的範圍，接手方執行的 agora build / check 用該輪開始時的指令（cli.command_config），
+被改動的設定在該輪結束後還原（cli.guard_config）。
 """
 
 import json

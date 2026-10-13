@@ -1077,12 +1077,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.4")
+        self.assertEqual(__version__, "0.2.5")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.4", out.getvalue())
+        self.assertIn("0.2.5", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1256,6 +1256,60 @@ class TestBuildAndSandbox(unittest.TestCase):
             # 只改其他設定 → 不動
             config.update_parties(root, models={"claude": "opus"})
             self.assertFalse(cli.guard_config(root, original, thread, "codex"))
+
+    def test_worker_cannot_run_build_it_just_rewrote(self):
+        """接手方在同一輪內改了 build 再執行 agora build：仍執行這輪開始時的指令，結束後設定檔還原"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            config.save(ws.root, {"build": [sys.executable, "-c", "print('ORIGINAL_BUILD')"]})
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex"])
+            state["relay"] = {"worker": "codex", "from": "claude", "handoff": "做事", "rounds": 0, "status": "starting"}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            seen = {}
+
+            def codex(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+                data = config.load(workspace)
+                data["build"] = [sys.executable, "-c", "print('EVIL_BUILD')"]
+                config.save(workspace, data)
+                out = io.StringIO()
+                with patch.dict(os.environ, opts["env"]), patch("sys.stdout", out), self.assertRaises(SystemExit):
+                    cli.cmd_build(cli.Workspace(workspace), argparse.Namespace())
+                seen["out"], seen["prompt"] = out.getvalue(), prompt
+                return "完成\n【工作完成】", "s1", "1s"
+
+            with patch.dict(cli.CALLERS, {"codex": codex}), patch.object(cli, "party_usage", return_value=None), \
+                    patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()):
+                cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
+            self.assertIn("ORIGINAL_BUILD", seen["out"])
+            self.assertNotIn("EVIL_BUILD", seen["out"])
+            self.assertIn("agora build", seen["prompt"].replace(cli.agora_cmd(), "agora"))
+            self.assertEqual(config.load(ws.root)["build"], [sys.executable, "-c", "print('ORIGINAL_BUILD')"])
+            self.assertIn("已還原", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+    def test_command_config_reads_locked_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            config.save(ws.root, {"build": "from-file"})
+            with patch.dict(os.environ):
+                os.environ.pop(parties.LOCKED_ENV, None)
+                self.assertEqual(cli.command_config(ws)["build"], "from-file")
+                os.environ[parties.LOCKED_ENV] = json.dumps({"build": "locked", "check": None})
+                self.assertEqual(cli.command_config(ws), {"build": "locked", "check": None})
+                os.environ[parties.LOCKED_ENV] = "not json"
+                with self.assertRaises(SystemExit):
+                    cli.command_config(ws)
+
+    def test_run_passes_env_only_when_given(self):
+        script = "import json,os\nprint(json.dumps({'locked': os.getenv('AGORA_LOCKED_COMMANDS'), " \
+                 "'invoked': os.getenv('AGORA_INVOKED')}))\n"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {parties.LOCKED_ENV: "stale"}):
+            events, _ = parties._run([sys.executable, "-c", script], Path(tmp), "", 30)
+            self.assertEqual(events, [{"locked": None, "invoked": "1"}])      # 外層殘留的不往下傳
+            events, _ = parties._run([sys.executable, "-c", script], Path(tmp), "", 30, None, {parties.LOCKED_ENV: "x"})
+            self.assertEqual(events, [{"locked": "x", "invoked": "1"}])
 
     def test_work_preamble_mentions_build_only_when_configured(self):
         fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",
