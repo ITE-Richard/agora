@@ -56,9 +56,12 @@ function agoraCommand() {
   return undefined;
 }
 
+/** Agora 使用的資料夾：多資料夾工作區時優先選已有 .agora 的那個，都沒有才用第一個 */
 function workspaceRoot() {
   const folders = vscode.workspace.workspaceFolders;
-  return folders && folders.length ? folders[0].uri.fsPath : undefined;
+  if (!folders || !folders.length) return undefined;
+  const withAgora = folders.find((f) => f.uri.scheme === "file" && fs.existsSync(path.join(f.uri.fsPath, ".agora")));
+  return (withAgora || folders[0]).uri.fsPath;
 }
 
 class AgoraError extends Error {}
@@ -686,16 +689,19 @@ function activate(context) {
     }
     const topic = await vscode.window.showInputBox({ prompt: "討論主題", ignoreFocusOut: true });
     if (!topic || !topic.trim()) return;
-    let parties = model.enabled();
-    if (parties.length > 1) {
+    const enabled = model.enabled();
+    let parties = enabled;
+    if (enabled.length > 1) {
       const picked = await vscode.window.showQuickPick(
-        parties.map((p) => ({ label: NAMES[p], party: p, picked: true })),
-        { canPickMany: true, placeHolder: "參與這個討論串的 AI（預設為此專案啟用的全部 AI）" },
+        enabled.map((p) => ({ label: NAMES[p], party: p, picked: true })),
+        { canPickMany: true, placeHolder: "參與這個討論串的 AI（全選時，之後在面板勾選的 AI 也會加入；少選則固定為這幾個）" },
       );
       if (!picked || !picked.length) return;
       parties = picked.map((x) => x.party);
     }
-    const id = (await runAgora(["new", topic.trim(), "--parties", parties.join(",")])).trim().split("\n").pop();
+    // 全選時不帶 --parties：討論串跟著面板的勾選，之後才勾選的 AI 也會加入
+    const partyArgs = parties.length === enabled.length ? [] : ["--parties", parties.join(",")];
+    const id = (await runAgora(["new", topic.trim(), ...partyArgs])).trim().split("\n").pop();
     threads.refresh();
     const thread = loadThreads().find((t) => t.id === id);
     if (!thread) return;
@@ -715,6 +721,7 @@ function activate(context) {
     if (!text) return;
     const enabled = model.enabled();
     const inThread = Object.keys(thread.state.parties).filter((p) => enabled.includes(p));
+    if (!thread.state.parties_fixed) inThread.push(...enabled.filter((p) => !inThread.includes(p)));   // 之後才勾選的 AI（同 cli.thread_parties）
     const target = await vscode.window.showQuickPick(
       [
         { label: "$(organization) 所有 AI 依序回覆", description: inThread.map((p) => NAMES[p]).join("、"), to: "all" },

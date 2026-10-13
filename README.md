@@ -14,6 +14,7 @@
 - 討論時若某一方用了不被允許的工具或終端指令而整輪中斷，會提醒它改用讀檔工具、接續同一段對話重試一次；仍失敗時記進逐字稿，並繼續請其他 AI 回覆。
 - 討論與分派都在**獨立的背景程序**執行，發起的那一方（你或某個 AI 的終端指令）只負責顯示進度：
   關掉 VSCode 視窗、終端指令逾時都不會中斷它們，結果照樣寫進逐字稿。
+- 同一個討論串可以一邊討論、一邊有接手方在背景工作：等 AI 回覆期間不鎖住討論串，兩邊的訊息都會寫入，期間新增的訊息下一次再轉給該 AI。
 
 工作區預設為目前資料夾的 git 根目錄，也可用 `--workspace` 指定。
 
@@ -82,7 +83,9 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 設定存在工作區的 `.agora/config.json`（`parties` 區段），沒設定的 AI 視為參與、模型與推理強度沿用各 CLI 的預設：
 
-- 未參與的 AI 不會被請求回覆、不會被挑為接手方；額度 hook 也只在參與的 AI 之間提醒交接。設定改了，既有討論串下一次呼叫就生效。
+- 勾選（啟用）表示同意該 AI 參與接下來的討論與分派；未參與的 AI 不會被請求回覆、不會被挑為接手方，額度 hook 也只在參與的 AI 之間提醒交接。
+- 設定改了，既有討論串下一次呼叫就生效：取消勾選的 AI 不再被請求回覆；之後才勾選的 AI 在下一次輪到時加入（`auto` 進行中也會在下一輪加入），第一次發言前會收到說明與完整討論內容。
+  用 `new --parties` 指定參與者的討論串固定為那幾個，不自動加入；已在背景進行的分派工作不會換接手方。
 - 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
 - `install` 只安裝參與中 AI 的 skills、hook 與權限。`agora install --status` 檢查此專案缺少或過期的項目（只有 `.agora/config.json` 不算安裝；在面板調整設定就會建立它）。
 - 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
@@ -150,6 +153,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 - 分派時用暫時的 git index 替工作區拍快照，存在 `refs/agora/<討論串>`（不動使用者的 index 與工作區；被忽略的檔案與 `.env`、金鑰不進快照），`changes` 與 VSCode 的「檢視分派期間的變更」以它為基準；清理討論串時一併刪除。期間任何人的修改都會列出。
 - 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。
+- hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
 - `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
 - Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`agora.py build`、`git status/diff/log`。權限是全域設定，升級後新增的指令要重新 `install` 才會加入（安裝狀態會顯示為需要更新）。
@@ -163,6 +167,8 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | `CLAUDE_PATH` / `AGY_PATH` / `CODEX_PATH` | 自動尋找 VSCode 擴充套件內建的執行檔 |
 | `AGORA_TIMEOUT` / `AGORA_WORK_TIMEOUT` | 600 / 7200 秒 |
 | `AGORA_QUOTA_THRESHOLD` | 5（%） |
+| `AGORA_MAX_WORK_ROUNDS` | 12（接手方最多跑幾輪；等額度、被拒重試不算） |
+| `AGORA_QUOTA_BACKOFF` | 900 秒（接手方回報額度用盡、但查不到重置時間時，等多久再試） |
 | `AGORA_AGY_POOL` | gemini（Antigravity 內 Gemini 與 Claude 模型是不同額度池） |
 
 工作區的 `.agora/config.json` 可設定：

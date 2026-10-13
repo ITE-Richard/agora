@@ -53,7 +53,8 @@ NO_SUBAGENT_NOTE = "（使用者設定：這次不要使用你內建的子代理
 DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
 LOCKED_ENV = "AGORA_LOCKED_COMMANDS"   # 接手方執行 agora build / check 時用的指令（分派當輪開始時的設定）
-QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|429|resource_exhausted|credits", re.I)
+QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|\b429\b|resource_exhausted|credits", re.I)
+NOISE_KEYS = re.compile(r"(^|_)id$|Id$|uuid|usage|duration|cost|tokens", re.I)
 
 HUMAN = "human"
 AI_PARTIES = ("claude", "antigravity", "codex")
@@ -106,6 +107,18 @@ def agora_cmd() -> str:
 def canonical(name: str) -> str:
     name = name.strip().lower()
     return ALIASES.get(name, name)
+
+
+def quota_error(result, *texts: str) -> bool:
+    """錯誤是否為額度用盡：只比對錯誤訊息，略過 result 裡的 ID、用量、耗時等欄位（UUID 與數字常剛好含 429）"""
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if not NOISE_KEYS.search(str(k))}
+        if isinstance(x, list):
+            return [strip(v) for v in x]
+        return x
+    text = json.dumps(strip(result), ensure_ascii=False) if result is not None else ""
+    return bool(QUOTA_ERROR.search("\n".join([text, *texts])))
 
 
 class CallError(RuntimeError):
@@ -240,7 +253,7 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
             events = [json.loads(stdout)]
         except json.JSONDecodeError:
             detail = f"(exit={proc.returncode})\n{stdout[-1500:]}\n{stderr[-1500:]}"
-            raise CallError(f"無法解析輸出 {detail}", bool(QUOTA_ERROR.search(detail)))
+            raise CallError(f"無法解析輸出 {detail}", quota_error(None, detail))
     return events, stderr
 
 
@@ -295,7 +308,7 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         reply = (result.get("response") or "").strip()
         if result.get("status") != "SUCCESS" or not reply:
             detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-            raise CallError(f"Antigravity 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)),
+            raise CallError(f"Antigravity 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
                             denied=bool(result.get("denied_actions")), session_id=result.get("conversation_id"))
         meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
         return reply, result.get("conversation_id") or session_id, meta
@@ -331,7 +344,10 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         cmd += ["--permission-mode", "acceptEdits",
                 "--allowedTools", f"Bash({agora_cmd()} quota*)", f"Bash({agora_cmd()} check*)",
                 f"Bash({agora_cmd()} build*)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
-                "--disallowedTools", "Read(./.env)", "Edit(./.env)", "Edit(./.agora/config.json)"]
+                "--disallowedTools", "Read(./.env)", "Edit(./.env)", "Edit(./.agora/config.json)",
+                # hook 與自動執行的設定：改了等於能執行任意指令（另見 cli.guard_files，事後一律還原）
+                "Edit(./.claude/**)", "Edit(./.agents/**)", "Edit(./.codex/**)", "Edit(./.git/**)",
+                "Edit(./.vscode/tasks.json)"]
     else:
         cmd += ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
     if not opts.get("subagents", True):
@@ -350,7 +366,7 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
     reply = (result.get("result") or "").strip()
     if result.get("is_error") or not reply:
         detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-        raise CallError(f"Claude 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)),
+        raise CallError(f"Claude 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
                         denied=bool(result.get("permission_denials")), session_id=result.get("session_id"))
     meta = f"{result.get('duration_ms', 0) / 1000:.0f}s, ${result.get('total_cost_usd', 0):.3f}"
     return reply, result.get("session_id") or session_id, meta
@@ -398,13 +414,14 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
     thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), session_id)
     messages = [e["item"].get("text", "") for e in events
                 if e.get("type") == "item.completed" and (e.get("item") or {}).get("type") == "agent_message"]
-    errors = [json.dumps(e, ensure_ascii=False) for e in events if e.get("type") in ("error", "turn.failed")]
+    failures = [e for e in events if e.get("type") in ("error", "turn.failed")]
+    errors = [json.dumps(e, ensure_ascii=False) for e in failures]
     if thread_id:
         quota.update_codex_snapshot_from_session(thread_id)
     reply = (messages[-1] if messages else "").strip()
     if errors or not reply:
         detail = "；".join(errors)[:1500] + stderr[-500:]
-        raise CallError(f"Codex 未產生回覆：{detail}", bool(QUOTA_ERROR.search(detail)), session_id=thread_id)
+        raise CallError(f"Codex 未產生回覆：{detail}", quota_error(failures, stderr[-500:]), session_id=thread_id)
     usage = next((e.get("usage") for e in reversed(events) if e.get("type") == "turn.completed"), {}) or {}
     meta = f"{usage.get('input_tokens', '?')}+{usage.get('output_tokens', '?')} tokens"
     if not allow_subagents and any((e.get("item") or {}).get("type") == "collab_tool_call" for e in events):

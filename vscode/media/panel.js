@@ -219,7 +219,9 @@
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshQuota" }) }, "更新額度"),
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshModels" }) }, "更新模型清單")));
       children.push(el("p", { class: "muted small" },
-        "設定存在 .agora/config.json，對此專案的所有討論串生效；未參與的 AI 不會被呼叫，也不會成為接手方。"
+        "勾選表示同意該 AI 參與此專案接下來的討論與分派：進行中的討論串在下一次輪到發言時就會加入它（先讀完前面的討論），"
+        + "取消勾選後不再請它回覆；已在背景進行的分派工作不會換人，用「新增討論串」時指定參與者的討論串也不會自動加入。"
+        + "設定存在 .agora/config.json；未參與的 AI 不會被呼叫，也不會成為接手方。"
         + "分配比例只影響自動挑選接手方（依近期接手輪數補足落後的一方），指定接手方時不受限制。"));
     }
     children.push(versionLine(state.versions || {}));

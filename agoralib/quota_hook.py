@@ -9,6 +9,8 @@
 只讀檔案、不做網路請求，確保 hook 本身很快；快取過期時另開背景程序更新。
 """
 
+from __future__ import annotations   # 支援 Python 3.9（型別標註用到 X | None）
+
 import json
 import os
 import sys

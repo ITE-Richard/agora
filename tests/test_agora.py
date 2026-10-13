@@ -33,7 +33,16 @@ class TestTargets(unittest.TestCase):
         s = state_with(["claude", "codex"])
         self.assertEqual(cli.targets_for(s, HUMAN, None), [])
         self.assertEqual(cli.targets_for(s, HUMAN, "codex"), ["codex"])
-        self.assertEqual(cli.targets_for(s, HUMAN, "all"), ["claude", "codex"])
+        self.assertEqual(cli.targets_for(s, HUMAN, "all", ["claude", "codex"]), ["claude", "codex"])
+
+    def test_newly_enabled_party_joins_unless_fixed(self):
+        s = state_with(["claude", "codex"])
+        enabled = ["claude", "antigravity", "codex"]
+        self.assertEqual(cli.thread_parties(s, enabled), ["claude", "codex", "antigravity"])
+        self.assertEqual(cli.targets_for(s, "claude", None, enabled), ["codex", "antigravity"])
+        self.assertEqual(cli.thread_parties(s, ["claude"]), ["claude"])           # 取消勾選的不再參與
+        s["parties_fixed"] = True                                                   # new --parties 指定的
+        self.assertEqual(cli.thread_parties(s, enabled), ["claude", "codex"])
 
     def test_aliases(self):
         self.assertEqual(canonical("Richard"), HUMAN)
@@ -66,16 +75,26 @@ class TestConsensus(unittest.TestCase):
         self.assertEqual(cli.agree(agreed, "codex", "還有問題"), set())
         self.assertEqual(cli.agree(agreed, "codex", "【已達成共識】"), {"claude", "codex"})
 
+    def test_marker_must_start_a_line(self):
+        self.assertTrue(cli.has_marker("分析如下\n\n【已達成共識】改用快照", cli.CONSENSUS))
+        self.assertTrue(cli.has_marker("說明\n**【工作完成】**", "【工作完成】"))
+        self.assertTrue(cli.has_marker("> 【已達成共識】", cli.CONSENSUS))
+        self.assertTrue(cli.has_marker("同意，【已達成共識】：改用快照", cli.CONSENSUS))
+        self.assertFalse(cli.has_marker("鎖的問題還沒解決，我還不會寫【已達成共識】。", cli.CONSENSUS))
+        self.assertFalse(cli.has_marker("我同意，但請先回覆「【已達成共識】」的條件", cli.CONSENSUS))
+        self.assertFalse(cli.has_marker("做完後會在最後一行寫【工作完成】", "【工作完成】"))
+
     def test_auto_stops_only_when_every_party_agrees(self):
         replies = ["【已達成共識】", "還有並發問題", "【已達成共識】", "【已達成共識】", "不該被呼叫"]
         calls = []
 
-        def fake_invoke(ws, thread, state, party):
+        def fake_invoke(ws, thread, party):
             calls.append(party)
             return replies[len(calls) - 1]
 
         with tempfile.TemporaryDirectory() as tmp:
             ws = cli.Workspace(Path(tmp))
+            config.update_parties(ws.root, disable=["antigravity"])
             thread = ws.threads / "t1"
             thread.mkdir(parents=True)
             cli.save_state(thread, state_with(["claude", "codex"]))
@@ -85,6 +104,53 @@ class TestConsensus(unittest.TestCase):
                 os.environ.pop(cli.NESTED_ENV, None)
                 cli.cmd_auto(ws, args)
         self.assertEqual(calls, ["claude", "codex", "claude", "codex"])
+
+    def run_auto(self, fake_invoke, rounds=6, before_round=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            config.update_parties(ws.root, disable=["antigravity"])
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            args = type("Args", (), {"thread": "t1", "rounds": rounds, "order": None})()
+            with patch.dict(os.environ, {jobs.JOB_ENV: str(thread)}), \
+                    patch.object(cli, "invoke", lambda w, t, p: fake_invoke(w, p)), \
+                    patch("sys.stdout", io.StringIO()), patch("sys.stderr", io.StringIO()):
+                os.environ.pop(cli.NESTED_ENV, None)
+                try:
+                    cli.cmd_auto(ws, args)
+                    return None
+                except SystemExit as e:
+                    return e.code
+
+    def test_auto_picks_up_party_enabled_mid_run(self):
+        calls = []
+
+        def fake_invoke(ws, party):
+            calls.append(party)
+            if len(calls) == 2:   # 第二輪進行中，使用者在面板勾選 Antigravity
+                config.update_parties(ws.root, enable=["antigravity"])
+            return "繼續討論"
+
+        self.run_auto(fake_invoke, rounds=4)
+        self.assertEqual(calls, ["claude", "codex", "antigravity", "claude"])
+
+    def test_auto_skips_failed_party(self):
+        calls = []
+
+        def fake_invoke(ws, party):
+            calls.append(party)
+            if party == "claude":
+                raise cli.CallFailed("呼叫 Claude Code 失敗")
+            return "繼續討論"
+
+        code = self.run_auto(fake_invoke, rounds=4)
+        self.assertEqual(calls, ["claude", "codex", "claude", "codex"])
+        self.assertIn("沒有回覆", code)
+        calls.clear()
+        code = self.run_auto(lambda ws, p: (calls.append(p), (_ for _ in ()).throw(cli.CallFailed("x")))[1])
+        self.assertEqual(calls, ["claude", "codex"])                 # 連續一整圈都失敗就結束
+        self.assertIn("所有 AI 都沒有回覆", code)
 
 
 SUMMARY = """## 共識
@@ -446,6 +512,30 @@ class TestDiscussionFailures(unittest.TestCase):
             self.assertIn("沒有回覆", str(ctx.exception.code))
             texts = [m["text"] for m in cli.load_state(thread)["messages"]]
             self.assertIn("Codex 的回覆", texts)
+
+    def test_others_can_write_while_waiting_for_reply(self):
+        """等 AI 回覆期間不持有鎖：接手程序能更新 relay，期間加的訊息不會被蓋掉，下次仍轉給它"""
+        def claude(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+            cli.update_relay(thread, status="done")                 # 同一串的接手程序在這時寫入
+            with cli.thread_lock(thread, wait=1):
+                state = cli.load_state(thread)
+                cli.add_message(thread, state, "codex", "接手方的回報", via_cli=True)
+                cli.save_state(thread, state)
+            return "Claude 的回覆", "s1", "1s"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.setup_thread(tmp)
+            args = type("Args", (), {"thread": "t1", "sender": "human", "to": "claude", "message": "請查證", "file": None})()
+            with patch.dict(os.environ, {jobs.JOB_ENV: str(thread)}), patch.dict(cli.CALLERS, {"claude": claude}), \
+                    patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()), \
+                    patch("sys.stderr", io.StringIO()):
+                os.environ.pop(cli.NESTED_ENV, None)
+                cli.cmd_send(ws, args)
+            state = cli.load_state(thread)
+            self.assertEqual(state["relay"]["status"], "done")
+            self.assertEqual([m["text"] for m in state["messages"]], ["請查證", "接手方的回報", "Claude 的回覆"])
+            self.assertIn("接手方的回報", cli.build_prompt(ws, state, "claude"))
+            self.assertNotIn("Claude 的回覆", cli.build_prompt(ws, state, "claude"))
 
 
 class TestSubagents(unittest.TestCase):
@@ -1002,6 +1092,10 @@ class TestJobs(unittest.TestCase):
             pid = jobs.spawn([sys.executable, "-c", "import time; time.sleep(30)"], Path(tmp), out, out)
             try:
                 self.assertTrue(jobs.pid_alive(pid))
+                started = jobs.pid_started(pid)
+                self.assertTrue(jobs.alive({"pid": pid, "pid_started": started}))
+                # PID 被別的程序重複使用：建立時間對不上就視為已結束
+                self.assertFalse(jobs.alive({"pid": pid, "pid_started": started - 100}))
             finally:
                 jobs.kill_tree(pid)
 
@@ -1077,12 +1171,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.5")
+        self.assertEqual(__version__, "0.2.6")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.5", out.getvalue())
+        self.assertIn("0.2.6", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1184,6 +1278,18 @@ class TestBuildAndSandbox(unittest.TestCase):
             self.assertNotIn("BUILD_OK", out)
             config.save(ws.root, {"build": [sys.executable, "-c", "import sys; sys.exit(2)"]})
             self.assertEqual(self.run_cmd(cli.cmd_build, ws)[0], 1)
+
+    def test_check_syntax_without_writing_pycache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            subprocess.run(["git", "init", "-q"], cwd=ws.root, check=True)
+            (ws.root / "good.py").write_text("x = 1\n", encoding="utf-8")
+            (ws.root / "bad.py").write_text("def f(:\n", encoding="utf-8")
+            code, out = self.run_cmd(cli.cmd_check, ws)
+            self.assertEqual(code, 1)
+            self.assertIn("2 個檔案，1 個錯誤", out)
+            self.assertIn("bad.py", out)
+            self.assertFalse((ws.root / "__pycache__").exists())
 
     def test_check_without_tests_dir_skips_unittest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1288,6 +1394,92 @@ class TestBuildAndSandbox(unittest.TestCase):
             self.assertIn("agora build", seen["prompt"].replace(cli.agora_cmd(), "agora"))
             self.assertEqual(config.load(ws.root)["build"], [sys.executable, "-c", "print('ORIGINAL_BUILD')"])
             self.assertIn("已還原", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+    def test_guard_files_restores_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, thread = Path(tmp), Path(tmp) / "thread"
+            thread.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.local.json").write_text('{"hooks": {}}', encoding="utf-8")
+            before = cli.protected_files(root)
+            self.assertEqual(cli.guard_files(root, before, thread, "codex"), [])
+            # 接手方加了 hook、新建 Antigravity hook 與 git pre-commit
+            (root / ".claude" / "settings.local.json").write_text('{"hooks": {"PostToolUse": "evil"}}', encoding="utf-8")
+            (root / ".agents").mkdir()
+            (root / ".agents" / "hooks.json").write_text("{}", encoding="utf-8")
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.write_text("evil", encoding="utf-8")
+            self.assertEqual(len(cli.guard_files(root, before, thread, "codex")), 3)
+            self.assertEqual((root / ".claude" / "settings.local.json").read_text(encoding="utf-8"), '{"hooks": {}}')
+            self.assertFalse((root / ".agents" / "hooks.json").exists())
+            self.assertFalse(hook.exists())
+            self.assertIn("已還原", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+    def test_claude_worker_cannot_edit_hook_settings(self):
+        seen = {}
+
+        def fake_run(cmd, *a, **k):
+            seen["cmd"] = cmd
+            return [{"type": "result", "result": "ok", "session_id": "s"}], ""
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(parties, "_run", fake_run):
+            parties.call_claude("做事", None, {}, True, Path(tmp), 60, Path(tmp))
+        denied = seen["cmd"][seen["cmd"].index("--disallowedTools"):]
+        for rule in ("Edit(./.claude/**)", "Edit(./.agents/**)", "Edit(./.git/**)"):
+            self.assertIn(rule, denied)
+
+    def test_python39_compatible(self):
+        """pyproject 宣告支援 3.9：X | None、list[...] 等標註在 3.9 執行時會出錯，要有 from __future__ import annotations"""
+        import ast
+        for path in (Path(cli.__file__).parent).glob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 9))
+            future = any(isinstance(n, ast.ImportFrom) and n.module == "__future__" for n in tree.body)
+            annotations = [n.returns for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))] \
+                + [n.annotation for n in ast.walk(tree) if isinstance(n, (ast.arg, ast.AnnAssign))]
+            modern = [a for a in annotations if a is not None and any(
+                isinstance(x, ast.BinOp) and isinstance(x.op, ast.BitOr)
+                or isinstance(x, ast.Subscript) and isinstance(x.value, ast.Name) and x.value.id in ("list", "dict", "tuple", "set")
+                for x in ast.walk(a))]
+            self.assertTrue(future or not modern, f"{path.name} 用了 3.10+ 的型別標註，請加 from __future__ import annotations")
+
+    def test_quota_error_ignores_ids_and_numbers(self):
+        self.assertFalse(parties.quota_error({"session_id": "a4291c", "duration_ms": 14290, "result": "boom"}))
+        self.assertFalse(parties.quota_error(None, "File x.py, line 1429"))
+        self.assertTrue(parties.quota_error({"result": "Claude AI usage limit reached"}))
+        self.assertTrue(parties.quota_error(None, "HTTP 429 Too Many Requests"))
+
+    def run_worker(self, codex, usage=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex"])
+            state["relay"] = {"worker": "codex", "from": "claude", "handoff": "做事", "rounds": 0, "status": "starting"}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            sleeps = []
+            with patch.dict(cli.CALLERS, {"codex": codex}), patch.object(cli, "party_usage", return_value=usage), \
+                    patch.object(cli, "git_status", return_value=""), patch.object(quota, "refresh"), \
+                    patch.object(cli, "sleep_until", lambda t, ts: sleeps.append(ts) or True), \
+                    patch.object(cli, "MAX_WORK_ROUNDS", 2), patch("sys.stdout", io.StringIO()):
+                cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
+            return cli.load_state(thread)["relay"], sleeps
+
+    def test_worker_backs_off_when_quota_error_but_usage_unknown(self):
+        calls = []
+
+        def codex(*a, **k):
+            calls.append(1)
+            if len(calls) <= 3:
+                raise parties.CallError("usage limit", quota_exhausted=True)
+            return "做完一步", "s1", "1s"
+
+        relay, sleeps = self.run_worker(codex)
+        self.assertEqual(len(sleeps), 3)                  # 每次都先等一段時間，不立刻重試
+        self.assertEqual(relay["status"], "max_rounds")
+        self.assertEqual(relay["rounds"], 2)              # 等待不算輪數：仍跑滿 2 輪
+        self.assertEqual(len(calls), 5)
 
     def test_command_config_reads_locked_env(self):
         with tempfile.TemporaryDirectory() as tmp:

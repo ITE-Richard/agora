@@ -31,18 +31,69 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def pid_alive(pid: Optional[int]) -> bool:
+def _win_process(pid: int):
+    """Windows：(是否存在, 建立時間 epoch 秒或 None)；直接查 Win32 API，比 tasklist 快很多"""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() == 5, None       # 拒絕存取表示存在（其他使用者的程序），其餘表示不存在
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:   # STILL_ACTIVE
+            return False, None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return True, None
+        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime   # 1601 年起的 100 奈秒
+        return True, ticks / 1e7 - 11644473600
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def pid_started(pid: Optional[int]) -> Optional[float]:
+    """程序的建立時間（用來分辨 PID 被重複使用）；取不到時為 None（目前只支援 Windows 與 Linux）"""
+    if not pid:
+        return None
+    if sys.platform.startswith("win"):
+        try:
+            return _win_process(pid)[1]
+        except (OSError, AttributeError):
+            return None
+    try:
+        return os.stat(f"/proc/{pid}").st_ctime
+    except OSError:
+        return None
+
+
+def pid_alive(pid: Optional[int], started: Optional[float] = None) -> bool:
+    """程序是否還在；有記錄建立時間時一併比對，PID 被別的程序重複使用（Windows 很常見）視為已結束"""
     if not pid:
         return False
     if sys.platform.startswith("win"):
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace").stdout
-        return str(pid) in out
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+        try:
+            exists, created = _win_process(pid)
+        except (OSError, AttributeError):
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace").stdout
+            exists, created = str(pid) in out.split(), None
+    else:
+        try:
+            os.kill(pid, 0)
+            exists = True
+        except OSError:
+            exists = False
+        created = pid_started(pid) if exists else None
+    if exists and started and created:
+        return abs(created - started) < 2
+    return exists
+
+
+def alive(record: dict) -> bool:
+    """job.json 或 relay 紀錄裡的背景程序（pid、pid_started）是否還在"""
+    return pid_alive(record.get("pid"), record.get("pid_started"))
 
 
 def kill_tree(pid: int):
@@ -115,7 +166,7 @@ def active(thread: Path) -> Optional[dict]:
         return None
     if job.get("status") == "starting" and time.time() - job.get("started_ts", 0) < 60:
         return job
-    if pid_alive(job.get("pid")):
+    if alive(job):
         return job
     update(thread, status="interrupted", current=None, finished=now_str())
     return None
@@ -134,7 +185,7 @@ def start(thread: Path, kind: str, argv: list, cwd: Path) -> dict:
 
 def run(thread: Path, func: Callable[[], None]):
     """在背景程序內執行討論，結束時寫入狀態與結束碼"""
-    update(thread, status="running", pid=os.getpid())
+    update(thread, status="running", pid=os.getpid(), pid_started=pid_started(os.getpid()))
     code = 0
     try:
         func()

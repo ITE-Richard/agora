@@ -35,6 +35,7 @@ from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS,
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
 MAX_WORK_ROUNDS = int(os.getenv("AGORA_MAX_WORK_ROUNDS", "12"))
+QUOTA_BACKOFF = int(os.getenv("AGORA_QUOTA_BACKOFF", "900"))   # 回報額度用盡、但查不到重置時間時，等多久再試
 CONSENSUS = "【已達成共識】"
 
 PREAMBLE = """\
@@ -48,7 +49,7 @@ PREAMBLE = """\
 2. 不要自行執行 agora.py 的討論或分派指令；你的回覆會由工具自動轉給其他人。
 3. 用繁體中文、一般技術文風回覆。
 4. 直接表達立場：同意就說同意並補充，不同意就說明理由；引用程式碼時標出 檔案:行號。對方的論點要先查證再接受。
-5. 回覆盡量控制在 600 字內，結尾用一兩句話總結立場或待解問題；認為已達成共識時寫出「【已達成共識】」與共識內容。
+5. 回覆盡量控制在 600 字內，結尾用一兩句話總結立場或待解問題；認為已達成共識時，另起一行以「【已達成共識】」開頭，接著寫共識內容。
    要所有參與的 AI 都接連寫出「【已達成共識】」才算達成；你仍有異議時就不要寫，並說明還差什麼。
 
 討論主題：{topic}
@@ -173,9 +174,13 @@ def save_state(thread: Path, state: dict):
     tmp.replace(thread / "state.json")
 
 
+LOCK_STALE = TIMEOUT + 120        # 鎖只包住讀改寫 state.json，留這麼久表示持有者已被強制結束
+WORKER_LOCK_WAIT = LOCK_STALE + 60   # 接手程序寫入結果時願意等多久（超過 LOCK_STALE 就會接手過期的鎖，不會放棄）
+
+
 @contextmanager
 def thread_lock(thread: Path, wait: int = 30):
-    """同一討論串同時只允許一個呼叫"""
+    """state.json 的讀改寫同時只允許一個程序；呼叫 AI 的 CLI 期間不要持有（可能要等好幾分鐘）"""
     lock = thread / ".lock"
     deadline = time.time() + wait
     while True:
@@ -184,13 +189,13 @@ def thread_lock(thread: Path, wait: int = 30):
             break
         except FileExistsError:
             try:
-                if time.time() - lock.stat().st_mtime > TIMEOUT + 120:
+                if time.time() - lock.stat().st_mtime > LOCK_STALE:
                     lock.unlink(missing_ok=True)
                     continue
             except OSError:
                 continue
             if time.time() > deadline:
-                sys.exit("此討論串正在等待回覆，請稍後再試。")
+                sys.exit("此討論串正被其他程序寫入，請稍後再試。")
             time.sleep(1)
     try:
         yield
@@ -264,8 +269,12 @@ def new_party(model: Optional[str] = None, effort: Optional[str] = None) -> dict
 
 
 def thread_parties(state: dict, enabled=AI_PARTIES) -> List[str]:
-    """討論串中目前仍在專案啟用名單內的 AI"""
-    return [p for p in state["parties"] if p in enabled]
+    """討論串目前的參與者：仍在專案啟用名單內的 AI，加上之後才勾選的 AI（勾選表示同意它參與接下來的討論；
+    第一次發言時會收到說明與完整討論內容）。用 new --parties 明確指定參與者的討論串不自動加入。"""
+    current = [p for p in state["parties"] if p in enabled]
+    if state.get("parties_fixed"):
+        return current
+    return current + [p for p in enabled if p not in state["parties"]]
 
 
 def require_enabled(ws: Workspace, party: str) -> str:
@@ -320,16 +329,31 @@ class CallFailed(SystemExit):
     """某一方沒有回覆（已寫進逐字稿）；send 會繼續請其他人回覆，其他指令照常結束"""
 
 
-def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
-    """請 party 讀取未讀訊息並回覆（呼叫者需持有 thread_lock）。
+def invoke(ws: Workspace, thread: Path, party: str) -> str:
+    """請 party 讀取未讀訊息並回覆。
+    呼叫 CLI 期間不持有 thread_lock，讓同一串的接手程序照常寫入：回覆回來後重新讀取 state 再寫入，
+    期間別人加進來的訊息仍算 party 未讀。
     因為用了不被允許的工具而整輪中斷時（部分 CLI 在非互動模式會這樣），提醒它改用讀檔工具，接續同一段對話重試一次。"""
-    info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
-    opts = call_opts(ws, state, party)
+    with thread_lock(thread):
+        state = load_state(thread)
+        info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
+        prompt, session = build_prompt(ws, state, party), info["session_id"]
+        seen = len(state["messages"])
+        opts = call_opts(ws, state, party)
     model = "、".join(opts[f] for f in config.FIELDS if opts.get(f))
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
     jobs.set_current(party)
     before = git_status(ws.root)
-    prompt, session = build_prompt(ws, state, party), info["session_id"]
+    sessions = []   # 這次開過的對話（包含失敗的），寫回 state 時一併記下
+
+    def save(update):
+        with thread_lock(thread):
+            fresh = load_state(thread)
+            for sid in sessions:
+                remember_session(fresh, party, sid)
+            update(fresh)
+            save_state(thread, fresh)
+
     for attempt in (1, 2):
         live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
         try:
@@ -337,7 +361,7 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
             break
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
-            remember_session(state, party, getattr(e, "session_id", None))
+            sessions.append(getattr(e, "session_id", None))
             if attempt == 1 and isinstance(e, CallError) and e.denied:
                 note = f"⚠️ {NAMES[party]} 用了不被允許的工具或終端指令，整輪被中斷；已提醒改用讀檔工具，重試一次。"
                 add_system_note(thread, note)
@@ -348,15 +372,18 @@ def invoke(ws: Workspace, thread: Path, state: dict, party: str) -> str:
                     prompt += "\n\n" + DENIED_RETRY
                 continue
             add_system_note(thread, f"⚠️ 呼叫 {NAMES[party]} 失敗：{e}")
-            save_state(thread, state)
+            save(lambda fresh: None)
             raise CallFailed(f"呼叫 {NAMES[party]} 失敗：{e}")
     live.close()
     after = git_status(ws.root)
-    info["session_id"] = session_id
-    remember_session(state, party, session_id)
-    add_message(thread, state, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x))
-    info["seen"] = len(state["messages"])
-    save_state(thread, state)
+    sessions.append(session_id)
+
+    def record(fresh):
+        info = fresh["parties"].setdefault(party, new_party())
+        info["session_id"] = session_id
+        add_message(thread, fresh, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x))
+        info["seen"] = seen   # 它自己的回覆在 build_prompt 會略過；呼叫期間別人加的訊息下次才轉給它
+    save(record)
     if before != after:
         warning = f"⚠️ {NAMES[party]} 回覆期間工作區有變動，請檢查 git status：\n{after or '(工作區已乾淨)'}"
         add_system_note(thread, warning)
@@ -375,6 +402,7 @@ def cmd_new(ws: Workspace, args):
         "topic": args.topic,
         "created": now_str(),
         "parties": {p: new_party(models.get(p), efforts.get(p)) for p in parties},
+        "parties_fixed": bool(args.parties),   # 明確指定參與者：之後在專案勾選的 AI 不自動加入
         "messages": [],
     }
     save_state(thread, state)
@@ -424,7 +452,7 @@ def in_background(ws: Workspace, thread: Path, kind: str, argv: List[str], text:
 
 def state_relay_active(thread: Path) -> bool:
     relay = load_state(thread).get("relay") or {}
-    return relay.get("status") in ("starting", "running", "waiting") and pid_alive(relay.get("pid"))
+    return relay.get("status") in ("starting", "running", "waiting") and jobs.alive(relay)
 
 
 def cmd_send(ws: Workspace, args):
@@ -438,21 +466,21 @@ def cmd_send(ws: Workspace, args):
         state = load_state(thread)
         add_message(thread, state, sender, text)
         save_state(thread, state)
-        targets = targets_for(state, sender, args.to, ws.enabled())
-        if not targets:
-            print("已記錄，尚未請任何一方回覆。")
-            return
-        failed = []
-        for party in targets:
-            try:   # 某一方失敗時繼續請其他人回覆
-                reply = invoke(ws, thread, state, party)
-            except CallFailed as e:
-                failed.append(party)
-                print(e.code, file=sys.stderr, flush=True)
-                continue
-            print(f"\n═══ {NAMES[party]} ═══\n{reply}" if len(targets) > 1 else reply)
-        if failed:
-            sys.exit(f"{'、'.join(NAMES[p] for p in failed)} 沒有回覆，原因已寫進逐字稿。")
+    targets = targets_for(state, sender, args.to, ws.enabled())
+    if not targets:
+        print("已記錄，尚未請任何一方回覆。")
+        return
+    failed = []
+    for party in targets:
+        try:   # 某一方失敗時繼續請其他人回覆
+            reply = invoke(ws, thread, party)
+        except CallFailed as e:
+            failed.append(party)
+            print(e.code, file=sys.stderr, flush=True)
+            continue
+        print(f"\n═══ {NAMES[party]} ═══\n{reply}" if len(targets) > 1 else reply)
+    if failed:
+        sys.exit(f"{'、'.join(NAMES[p] for p in failed)} 沒有回覆，原因已寫進逐字稿。")
 
 
 def cmd_reply(ws: Workspace, args):
@@ -460,13 +488,19 @@ def cmd_reply(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     party = require_enabled(ws, canonical(args.party))
     in_background(ws, thread, "reply", ["reply", thread.name, "--party", party])
-    with thread_lock(thread):
-        print(invoke(ws, thread, load_state(thread), party))
+    print(invoke(ws, thread, party))
+
+
+def has_marker(reply: str, marker: str) -> bool:
+    """回覆裡有沒有標記（【已達成共識】、【工作完成】等）：要在某一行的開頭（可帶 markdown 的 #、>、*、- 等，
+    或「好，」「同意 」這類以標點或空白隔開的短開頭）；句子中間或引號裡提到的不算，
+    例如「我還不會寫【已達成共識】」「完成後會寫【工作完成】」"""
+    return bool(re.search(rf"^[\s>*#_\-]*(?:[^\s「『\"“]{{1,4}}[，,、：:\s]+)?{re.escape(marker)}", reply, re.M))
 
 
 def agree(agreed: set, party: str, reply: str) -> set:
     """共識要所有發言方連續表示同意：有人沒寫「【已達成共識】」就重新計算"""
-    return agreed | {party} if CONSENSUS in reply else set()
+    return agreed | {party} if has_marker(reply, CONSENSUS) else set()
 
 
 def cmd_auto(ws: Workspace, args):
@@ -474,26 +508,35 @@ def cmd_auto(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     in_background(ws, thread, "auto", ["auto", thread.name, "--rounds", str(args.rounds)]
                   + (["--order", args.order] if args.order else []))
-    with thread_lock(thread):
-        state = load_state(thread)
-        order = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order \
-            else thread_parties(state, ws.enabled())
+    fixed = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order else None
+    last = next((m["speaker"] for m in reversed(load_state(thread)["messages"]) if m["speaker"] in AI_PARTIES), None)
+    agreed, failed, streak = set(), [], 0
+    for i in range(args.rounds):
+        # 沒指定順序時每輪重新取得參與者：進行中才勾選的 AI 下一輪就加入，取消勾選的不再輪到
+        order = fixed or thread_parties(load_state(thread), ws.enabled())
         if not order:
             sys.exit("此討論串沒有任何啟用中的 AI。")
-        last = next((m["speaker"] for m in reversed(state["messages"]) if m["speaker"] in order), None)
-        idx = (order.index(last) + 1) % len(order) if last in order else 0
-        agreed = set()
-        for i in range(args.rounds):
-            party = order[idx]
-            reply = invoke(ws, thread, state, party)
-            print(f"\n═══ 第 {i + 1}/{args.rounds} 輪 · {NAMES[party]} ═══\n{reply}")
-            agreed = agree(agreed, party, reply)
-            if agreed >= set(order):
-                print("\n（各方都表示已達成共識，提前結束）")
-                break
-            if agreed:
-                print(f"\n（{'、'.join(NAMES[p] for p in order if p in agreed)} 認為已達成共識，等其他方確認）")
-            idx = (idx + 1) % len(order)
+        party = order[(order.index(last) + 1) % len(order)] if last in order else order[0]
+        last = party
+        try:   # 某一方失敗時跳過它繼續；連續一整圈都失敗才結束
+            reply = invoke(ws, thread, party)
+        except CallFailed as e:
+            print(e.code, file=sys.stderr, flush=True)
+            failed.append(party)
+            agreed, streak = set(), streak + 1
+            if streak >= len(order):
+                sys.exit("所有 AI 都沒有回覆，自動討論結束，原因已寫進逐字稿。")
+            continue
+        streak = 0
+        print(f"\n═══ 第 {i + 1}/{args.rounds} 輪 · {NAMES[party]} ═══\n{reply}")
+        agreed = agree(agreed, party, reply)
+        if agreed >= set(order):
+            print("\n（各方都表示已達成共識，提前結束）")
+            break
+        if agreed:
+            print(f"\n（{'、'.join(NAMES[p] for p in order if p in agreed)} 認為已達成共識，等其他方確認）")
+    if failed:
+        sys.exit(f"{'、'.join(dict.fromkeys(NAMES[p] for p in failed))} 有幾輪沒有回覆，原因已寫進逐字稿。")
 
 
 # ───────────────────────── 總結 ─────────────────────────
@@ -569,35 +612,39 @@ def cmd_summarize(ws: Workspace, args):
         sys.exit(f"{NAMES[party]} 額度不足（剩 {usage.get('remaining_pct', 0):.0f}%），"
                  + (f"可改用 --by {other}。" if other else "其他 AI 的額度也不足。"))
     in_background(ws, thread, "summarize", ["summarize", thread.name, "--by", party])
-    with thread_lock(thread):
-        state = load_state(thread)
-        messages = state["messages"]
-        if not messages:
-            sys.exit("此討論串還沒有任何發言。")
-        transcript = "\n\n".join(f"【{NAMES.get(m['speaker'], m['speaker'])} · {m['time']}】\n{m['text']}"
-                                 for m in messages)
-        prompt = SUMMARY_PROMPT.format(me=NAMES[party], topic=state["topic"], count=len(messages),
-                                       workspace=ws.root) + "\n" + transcript
-        opts = call_opts(ws, state, party)
-        print(f"…等待 {NAMES[party]} 產出總結", file=sys.stderr, flush=True)
-        jobs.set_current(party)
-        live = Live(live_path(thread, "discussion"), f"{NAMES[party]}（總結）", ws.root)
-        try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿
-            reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
-        except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            live.close()
-            add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
+    state = load_state(thread)
+    messages = state["messages"]
+    if not messages:
+        sys.exit("此討論串還沒有任何發言。")
+    transcript = "\n\n".join(f"【{NAMES.get(m['speaker'], m['speaker'])} · {m['time']}】\n{m['text']}"
+                             for m in messages)
+    prompt = SUMMARY_PROMPT.format(me=NAMES[party], topic=state["topic"], count=len(messages),
+                                   workspace=ws.root) + "\n" + transcript
+    opts = call_opts(ws, state, party)
+    print(f"…等待 {NAMES[party]} 產出總結", file=sys.stderr, flush=True)
+    jobs.set_current(party)
+    live = Live(live_path(thread, "discussion"), f"{NAMES[party]}（總結）", ws.root)
+    try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿；呼叫期間不持有 thread_lock（見 invoke）
+        reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
+    except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        live.close()
+        add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
+        with thread_lock(thread):
+            state = load_state(thread)
             remember_session(state, party, getattr(e, "session_id", None))
             save_state(thread, state)
-            sys.exit(f"{NAMES[party]} 產出總結失敗：{e}")
-        live.close()
+        sys.exit(f"{NAMES[party]} 產出總結失敗：{e}")
+    live.close()
+    try:
+        order, error = work_order(reply), None
+    except ValueError as e:
+        order, error = "", str(e)
+    with thread_lock(thread):
+        state = load_state(thread)
         remember_session(state, party, session_id)
-        try:
-            order, error = work_order(reply), None
-        except ValueError as e:
-            order, error = "", str(e)
         add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {meta}")
-        state["summary"] = {"by": party, "time": now_str(), "messages": len(state["messages"]),
+        # 涵蓋到總結本身；總結期間別人加的訊息不算涵蓋，之後依此總結分派時會提示過期
+        state["summary"] = {"by": party, "time": now_str(), "messages": len(messages) + 1,
                             "files": referenced_files(ws.root, order), "error": error}
         save_state(thread, state)
         (thread / "summary.md").write_text(
@@ -630,7 +677,7 @@ def relay_paths(thread: Path) -> dict:
 
 
 def update_relay(thread: Path, **fields) -> dict:
-    with thread_lock(thread, wait=120):
+    with thread_lock(thread, wait=WORKER_LOCK_WAIT):
         state = load_state(thread)
         state.setdefault("relay", {}).update(fields, updated=now_str())
         save_state(thread, state)
@@ -647,9 +694,6 @@ def stop_requested(thread: Path) -> bool:
 def party_usage(party: str) -> Optional[dict]:
     quota.refresh(min_interval=120)
     return quota.usage(party)
-
-
-pid_alive = jobs.pid_alive
 
 
 def pick_worker(ws: Workspace, owner: str, candidates: List[str]) -> str:
@@ -680,11 +724,8 @@ def cmd_assign(ws: Workspace, args):
     else:
         text = read_message(args)
     worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
-    if worker not in state["parties"]:
-        state["parties"][worker] = new_party()
-        save_state(thread, state)
     old = state.get("relay") or {}
-    if old.get("status") in ("starting", "running", "waiting") and pid_alive(old.get("pid")):
+    if old.get("status") in ("starting", "running", "waiting") and jobs.alive(old):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
 
     paths = relay_paths(thread)
@@ -702,6 +743,7 @@ def cmd_assign(ws: Workspace, args):
 
     with thread_lock(thread):
         state = load_state(thread)
+        state["parties"].setdefault(worker, new_party())
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           "session_id": args.session, "external_session": args.session,
@@ -712,7 +754,7 @@ def cmd_assign(ws: Workspace, args):
     entry = AGORA_ROOT_DIR / "agora.py"
     pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
                      ws.root, paths["log"], paths["log"], append=True)
-    update_relay(thread, pid=pid)
+    update_relay(thread, pid=pid, pid_started=jobs.pid_started(pid))
     print(f"已分派給 {NAMES[worker]}（背景程序 PID {pid}，關閉視窗也會繼續）。")
     if baseline.get("error"):
         print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
@@ -813,6 +855,65 @@ def guard_config(root: Path, original: Optional[str], thread: Path, worker: str)
     return True
 
 
+# 接手方不能改的檔案：hook 與會自動執行指令的設定，改了等於繞過終端指令的白名單
+# （下一次 Agora 呼叫 AI、使用者 commit 或開啟資料夾時就會執行）。Claude 直接禁止編輯，其他 CLI 只能事後還原。
+PROTECTED_FILES = (".claude/settings.json", ".claude/settings.local.json", ".agents/hooks.json",
+                   ".codex/config.toml", ".vscode/tasks.json")
+
+
+def git_hooks_dir(root: Path) -> Optional[Path]:
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=root, capture_output=True, text=True,
+                             encoding="utf-8", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode or not out.stdout.strip():
+        return None
+    path = Path(out.stdout.strip())
+    return path if path.is_absolute() else root / path
+
+
+def protected_files(root: Path) -> dict:
+    """受保護檔案目前的內容：{顯示用路徑: bytes 或 None（不存在）}"""
+    out = {}
+    for rel in PROTECTED_FILES:
+        try:
+            out[rel] = (root / rel).read_bytes()
+        except OSError:
+            out[rel] = None
+    hooks = git_hooks_dir(root)
+    if hooks and hooks.is_dir():
+        for p in hooks.iterdir():
+            if p.is_file():
+                try:
+                    out[str(p)] = p.read_bytes()
+                except OSError:
+                    pass
+    return out
+
+
+def guard_files(root: Path, before: dict, thread: Path, worker: str) -> List[str]:
+    """接手一輪結束後，受保護的檔案被新增、修改或刪除就還原，並記在逐字稿"""
+    after = protected_files(root)
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    for key in changed:
+        path = Path(key) if Path(key).is_absolute() else root / key
+        try:
+            if before.get(key) is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(before[key])
+        except OSError:
+            pass
+    if changed:
+        shown = [Path(k).relative_to(root).as_posix() if Path(k).is_absolute() and root in Path(k).parents else k
+                 for k in changed]
+        add_system_note(thread, f"⚠️ {NAMES[worker]} 這輪改動了 hook 或自動執行的設定（{'、'.join(shown)}），已還原。"
+                                f"這些檔案只能由 {NAMES[HUMAN]} 修改；若是 {NAMES[HUMAN]} 在這段期間自己改的，請再改一次。")
+    return changed
+
+
 def cmd_work(ws: Workspace, args):
     """背景接手程序（由 assign 啟動）"""
     thread = ws.resolve_thread(args.thread)
@@ -821,8 +922,9 @@ def cmd_work(ws: Workspace, args):
     worker, owner = relay["worker"], relay["from"]
     log = lambda msg: print(f"[{now_str()}] {msg}", flush=True)  # noqa: E731
 
-    denial_retries, denial_note = 0, ""
-    for _ in range(MAX_WORK_ROUNDS):
+    # 輪數上限只算真正跑完的輪；等額度、被拒重試不算（等待有時間間隔，被拒重試另有上限，不會空轉）
+    denial_retries, denial_note, rounds = 0, "", relay.get("rounds", 0)
+    while rounds < MAX_WORK_ROUNDS:
         if stop_requested(thread):
             update_relay(thread, status="stopped", waiting_until=None)
             add_system_note(thread, f"🔁 {NAMES[owner]} 已收回工作，{NAMES[worker]} 停止接手。")
@@ -860,6 +962,7 @@ def cmd_work(ws: Workspace, args):
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
         config_before = read_config_text(ws.root)
+        files_before = protected_files(ws.root)
         opts = call_opts(ws, state, worker)
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
@@ -869,16 +972,24 @@ def cmd_work(ws: Workspace, args):
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
             guard_config(ws.root, config_before, thread, worker)
+            guard_files(ws.root, files_before, thread, worker)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
             if getattr(e, "session_id", None):
-                with thread_lock(thread, wait=120):
+                with thread_lock(thread, wait=WORKER_LOCK_WAIT):
                     state = load_state(thread)
                     remember_session(state, worker, e.session_id, e.session_id == relay.get("external_session"))
                     save_state(thread, state)
             if exhausted or quota.low(party_usage(worker)):
                 quota.refresh(force=True)
+                if not quota.low(party_usage(worker)):
+                    # 判定額度用盡，但查到的額度看不出不足（快取過舊或查不到）：先等一段時間，不要立刻重試
+                    wake = time.time() + QUOTA_BACKOFF
+                    update_relay(thread, status="waiting", waiting_until=wake)
+                    add_system_note(thread, f"⏸ {NAMES[worker]} 回報額度用盡，但查不到確切的重置時間，"
+                                            f"等到 {quota.fmt_time(wake)} 再試。")
+                    sleep_until(thread, wake)
                 continue
             if isinstance(e, CallError) and e.denied and denial_retries < 3:
                 denial_retries += 1
@@ -890,23 +1001,25 @@ def cmd_work(ws: Workspace, args):
             update_relay(thread, status="failed", error=str(e)[:500])
             return
         live.close()
+        guard_config(ws.root, config_before, thread, worker)
+        guard_files(ws.root, files_before, thread, worker)
         changed = git_status(ws.root)
 
-        with thread_lock(thread, wait=120):
+        with thread_lock(thread, wait=WORKER_LOCK_WAIT):
             state = load_state(thread)
             add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}")
             state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str())
             remember_session(state, worker, session_id, session_id == relay.get("external_session"))
             save_state(thread, state)
+        rounds += 1
         shares.record(ws.root, worker, thread.name)
-        guard_config(ws.root, config_before, thread, worker)
         if before != changed:
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
 
-        if "【工作完成】" in reply:
+        if has_marker(reply, "【工作完成】"):
             update_relay(thread, status="done")
             return
-        if "【已暫停】" in reply:
+        if has_marker(reply, "【已暫停】"):
             update_relay(thread, status="stopped")
             return
     update_relay(thread, status="max_rounds")
@@ -921,7 +1034,7 @@ def cmd_status(ws: Workspace, args):
         if not relay:
             print("此討論串沒有分派紀錄。")
             return
-        alive = pid_alive(relay.get("pid"))
+        alive = jobs.alive(relay)
         if not (alive and relay["status"] in ("starting", "running", "waiting")) or time.time() >= deadline:
             break
         time.sleep(15)
@@ -1008,17 +1121,18 @@ def cmd_build(ws: Workspace, args):
 def cmd_check(ws: Workspace, args):
     """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
     （沒設定時，有 tests/ 才跑 unittest）。建置另用 agora build"""
-    import py_compile
     files = subprocess.run(["git", "ls-files", "*.py"], cwd=ws.root, capture_output=True, text=True,
                            encoding="utf-8").stdout.split()
     files += subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "*.py"], cwd=ws.root,
                             capture_output=True, text=True, encoding="utf-8").stdout.split()
     errors = []
-    for f in files:
+    for f in files:   # 只檢查語法、不寫 __pycache__（唯讀沙箱裡也能執行）
         try:
-            py_compile.compile(str(ws.root / f), doraise=True)
-        except py_compile.PyCompileError as e:
-            errors.append(str(e))
+            compile((ws.root / f).read_bytes(), f, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as e:
+            errors.append(f"{f}: {e}")
+        except OSError:
+            pass   # 已刪除但還在 git 索引裡的檔案
     if files:
         print(f"語法檢查：{len(files)} 個檔案，{len(errors)} 個錯誤")
     for e in errors:
@@ -1155,7 +1269,7 @@ def activity(ws: Workspace) -> List[dict]:
                           "pid": job.get("pid"), "live": str(live) if live.exists() else None})
         relay = state.get("relay") or {}
         if relay.get("status") in ("starting", "running", "waiting"):
-            if pid_alive(relay.get("pid")):
+            if jobs.alive(relay):
                 live = live_path(thread, "work")
                 items.append({"thread": thread.name, "topic": state["topic"], "type": "relay",
                               "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),

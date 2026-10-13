@@ -12,6 +12,8 @@ Claude Code、Antigravity、Codex 剩餘額度查詢
   python agora.py quota [--refresh] [--json]
 """
 
+from __future__ import annotations   # 支援 Python 3.9（型別標註用到 X | None）
+
 import json
 import os
 import re
@@ -30,8 +32,6 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-# Antigravity 有多個 hub 時，優先選開著目前工作區的那個
-WORKSPACE = Path(os.getenv("AGORA_WORKSPACE") or os.getcwd())
 AGORA_HOME = Path.home() / ".agora"
 CLAUDE_SNAPSHOT = Path.home() / ".claude" / "usage_snapshot.json"
 AGY_CACHE = AGORA_HOME / "antigravity_quota.json"
@@ -300,7 +300,8 @@ def _candidates() -> list[dict]:
             seen.add((proto, str(port)))
             found.append({"protocol": proto, "port": int(port), "csrf": csrf, "priority": priority})
 
-    ws = str(WORKSPACE).lower().replace("/", "\\")
+    # Antigravity 有多個 hub 時，優先選開著目前工作區的那個；查詢時才讀（cli 解析 --workspace 後才設定 AGORA_WORKSPACE）
+    ws = str(Path(os.getenv("AGORA_WORKSPACE") or os.getcwd())).lower().replace("/", "\\")
     for p in _list_processes():
         cl = p.get("CommandLine") or ""
         prio = 0 if ws in cl.lower().replace("/", "\\") else 1
