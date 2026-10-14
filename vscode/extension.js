@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const editorCtx = require("./context");
 const { syncCore } = require("./core");
+const { findPython, missingPythonMessage } = require("./python");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const EXTENSION_VERSION = require("./package.json").version;
@@ -47,13 +48,27 @@ function findOnPath(name) {
 
 /** 執行 Agora 的方式，依序：設定 agora.root → PATH 上的 agora 指令（pip install -e）→ 擴充套件內建的核心 */
 function agoraCommand() {
-  const python = vscode.workspace.getConfiguration("agora").get("pythonPath") || "python";
+  const python = findPython({ configured: vscode.workspace.getConfiguration("agora").get("pythonPath") });
   const root = agoraRoot();
-  if (root) return { cmd: python, prefix: [path.join(root, "agora.py")], source: root };
+  if (root) return { cmd: python.cmd, prefix: [...python.args, path.join(root, "agora.py")], source: root, python };
   const exe = findOnPath("agora");
   if (exe) return { cmd: exe, prefix: [], source: exe };
-  if (bundledCore) return { cmd: python, prefix: [path.join(bundledCore, "agora.py")], source: bundledCore };
+  if (bundledCore) {
+    return { cmd: python.cmd, prefix: [...python.args, path.join(bundledCore, "agora.py")], source: bundledCore, python };
+  }
   return undefined;
+}
+
+/** 子程序的環境變數：找到的 Python 與它的 Scripts 放在 PATH 最前面，
+ * 讓 Agora 呼叫的 CLI（例如 Claude 的額度 hook：python …/quota_hook.py）也找得到同一個 Python */
+function childEnv(agora) {
+  const env = { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" };
+  const cmd = agora.python && agora.python.cmd;
+  if (cmd && path.isAbsolute(cmd) && !/py\.exe$/i.test(cmd)) {
+    const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") || "PATH";
+    env[key] = [path.dirname(cmd), path.join(path.dirname(cmd), "Scripts"), env[key]].filter(Boolean).join(path.delimiter);
+  }
+  return env;
 }
 
 /** Agora 使用的資料夾：多資料夾工作區時優先選已有 .agora 的那個，都沒有才用第一個 */
@@ -92,7 +107,7 @@ function runAgora(args, { input, token, onProgress, log = true } = {}) {
   return new Promise((resolve, reject) => {
     const proc = cp.spawn(cmd, fullArgs, {
       cwd: ws,
-      env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+      env: childEnv(agora),
       windowsHide: true,
     });
     let stdout = "";
@@ -109,12 +124,16 @@ function runAgora(args, { input, token, onProgress, log = true } = {}) {
       const line = d.trim().split("\n").pop();
       if (onProgress && line) onProgress(line);
     });
-    proc.on("error", (e) => reject(new AgoraError(`無法執行 ${cmd}：${e.message}`)));
+    proc.on("error", (e) => reject(new AgoraError(
+      (e.code === "ENOENT" && agora.python && missingPythonMessage(9009)) || `無法執行 ${cmd}：${e.message}`)));
     proc.on("close", (code) => {
+      const missing = agora.python && missingPythonMessage(code, stderr);
       if (code === 0) {
         resolve(stdout);
       } else if (token && token.isCancellationRequested) {
         reject(new AgoraError("已取消。"));
+      } else if (missing) {
+        reject(new AgoraError(missing));
       } else {
         const message = stderr.trim().split("\n").slice(-3).join("\n") || stdout.trim().split("\n").pop();
         reject(new AgoraError(message || `agora ${args[0]} 失敗（exit ${code}）`));
