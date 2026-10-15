@@ -410,7 +410,8 @@ def refresh_in_background():
         return
     kwargs = {}
     if sys.platform.startswith("win"):
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        # 隱藏主控台，refresh 呼叫的 CLI 才不會各開一個視窗（見 jobs.FLAGS）
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         kwargs["creationflags"] = flags
     else:
         kwargs["start_new_session"] = True

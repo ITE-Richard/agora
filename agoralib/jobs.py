@@ -23,7 +23,10 @@ JOB_ENV = "AGORA_JOB"          # 背景程序內設為討論串路徑
 RUNNING = ("starting", "running")
 FLAGS = 0
 if sys.platform.startswith("win"):
-    FLAGS = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    # 用隱藏的主控台（CREATE_NO_WINDOW）而不是完全沒有主控台（DETACHED_PROCESS）：
+    # 背景程序再呼叫 agy／codex／claude／git 時會沿用這個隱藏主控台；
+    # 若完全沒有主控台，Windows 會替每個子程序開新視窗（Windows Terminal 會多出一個分頁）
+    FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 BREAKAWAY = 0x01000000          # CREATE_BREAKAWAY_FROM_JOB：呼叫者若在 Windows job 內，也一併脫離
 
 
