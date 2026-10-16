@@ -788,6 +788,81 @@ def cmd_changes(ws: Workspace, args):
         print(f"\n查看內容：git diff {base['commit'][:12]} -- <檔案>（未追蹤的新檔不在 git diff 內）")
 
 
+def append_progress(thread: Path, title: str, body: str = ""):
+    """Agora 自己寫進進度檔的紀錄（與接手方寫的進度並列，方便分派方一起看）"""
+    with open(relay_paths(thread)["progress"], "a", encoding="utf-8") as f:
+        f.write(f"\n## {now_str()} · Agora：{title}\n" + (f"\n{body.strip()}\n" if body.strip() else ""))
+
+
+def denial_kind(action: str) -> str:
+    action = (action or "").lower()
+    if action.startswith("mcp"):
+        return "mcp"
+    if action in ("read_url", "execute_url", "web_search", "command", "write_file"):
+        return action
+    if action in ("run_command", "bash", "shell"):
+        return "command"
+    if "url" in action:
+        return "read_url"
+    if "write" in action or "edit" in action:
+        return "write_file"
+    return "other"
+
+
+def _targets(denials: list) -> str:
+    targets = list(dict.fromkeys(d["target"] for d in denials if d.get("target")))
+    return f"（{'、'.join(targets[:3])}{'…' if len(targets) > 3 else ''}）" if targets else ""
+
+
+DENIAL_NOTES = {
+    "command": "上一輪因為執行了未授權的終端指令{targets}而中斷。列目錄、讀檔、搜尋請改用內建檔案工具，"
+               "終端指令只用工作方式裡列出的那幾個，一字不差、不加參數。",
+    "read_url": "上一輪讀取網址{targets}被拒，整輪中斷。這個網址不在允許清單；如果工作需要這份來源，"
+                "請停止並回報【已暫停】，不要用記憶或其他來源替代。",
+    "execute_url": "上一輪開啟網址{targets}被拒，整輪中斷。這個網址不在允許清單；如果工作需要它，"
+                   "請停止並回報【已暫停】，不要用記憶或其他來源替代。",
+    "web_search": "上一輪網路搜尋{targets}被拒，整輪中斷。目前不允許搜尋；如果工作需要外部資料，"
+                  "請停止並回報【已暫停】，不要用記憶替代。",
+    "write_file": "上一輪寫入檔案{targets}被拒，整輪中斷。只能修改工作區內、工作單範圍的檔案；"
+                  "需要改其他位置時，請停止並回報【已暫停】，說明要改什麼。",
+    "mcp": "上一輪使用 MCP 工具{targets}被拒，整輪中斷。這個工具不在允許清單；如果工作需要它，"
+           "請停止並回報【已暫停】，不要用其他方式替代它的結果。",
+    "other": "上一輪使用的工具{targets}被拒，整輪中斷。它不在允許清單，請改用允許的工具完成；"
+             "做不到時停止並回報【已暫停】，說明需要什麼權限。",
+}
+
+
+def denial_note_for(denials: list) -> str:
+    """接續被拒的那一輪時附加的說明：依被拒動作的種類各說一次"""
+    by_kind: dict = {}
+    for d in denials:
+        by_kind.setdefault(denial_kind(d.get("action")), []).append(d)
+    if "other" in by_kind:   # 沒有對應說明的種類，把種類名稱也帶上
+        by_kind["other"] = [{"target": f"{d.get('action') or 'unknown'}：{d['target']}" if d.get("target")
+                             else d.get("action") or "unknown"} for d in by_kind["other"]]
+    return "".join("\n" + DENIAL_NOTES[k].format(targets=_targets(v)) for k, v in by_kind.items())
+
+
+def denial_summary(relay: dict) -> Optional[str]:
+    """「本次接手有 N 次工具被拒：read_url ×2」；沒有被拒時回傳 None"""
+    denied = relay.get("denied") or []
+    if not denied:
+        return None
+    counts: dict = {}
+    for d in denied:
+        action = d.get("action") or "unknown"
+        counts[action] = counts.get(action, 0) + 1
+    return f"本次接手有 {len(denied)} 次工具被拒：" + "、".join(f"{a} ×{n}" for a, n in counts.items())
+
+
+def unverified_warning(relay: dict) -> Optional[str]:
+    """工具被拒過、之後卻宣告完成：結果可能沒有依據，提醒分派方查證"""
+    if relay.get("status") == "done" and relay.get("denied"):
+        return ("接手期間有工具被拒，之後卻宣告【工作完成】：被拒的來源可能沒有真的讀到，"
+                "請查證結果的依據（例如被拒的網址、指令輸出），不要直接採用。")
+    return None
+
+
 def sleep_until(thread: Path, ts: float) -> bool:
     while time.time() < ts:
         if stop_requested(thread):
@@ -991,13 +1066,18 @@ def cmd_work(ws: Workspace, args):
                                             f"等到 {quota.fmt_time(wake)} 再試。")
                     sleep_until(thread, wake)
                 continue
-            if isinstance(e, CallError) and e.denied and denial_retries < 3:
-                denial_retries += 1
-                if e.session_id:
-                    update_relay(thread, session_id=e.session_id)
-                denial_note = ("\n上一輪因為執行了未授權的終端指令而中斷。列目錄、讀檔、搜尋請改用內建檔案工具，"
-                               "終端指令只用工作方式裡列出的那幾個，一字不差、不加參數。")
-                continue
+            if isinstance(e, CallError) and e.denied:
+                n = relay["rounds"] + 1
+                entries = [{"round": n, "time": now_str(), **d} for d in e.denials]
+                relay = update_relay(thread, denied=(load_state(thread).get("relay") or {}).get("denied", []) + entries,
+                                     **({"session_id": e.session_id} if e.session_id else {}))
+                lines = "\n".join(f"- {d['action']}" + (f"：{d['target']}" if d.get("target") else "") for d in e.denials)
+                append_progress(thread, f"第 {n} 輪工具被拒，整輪中斷（{denial_summary(relay)}）", lines)
+                add_system_note(thread, f"⚠️ {NAMES[worker]} 接手第 {n} 輪有工具被拒：\n{lines}\n（{denial_summary(relay)}）")
+                if denial_retries < 3:
+                    denial_retries += 1
+                    denial_note = denial_note_for(e.denials)
+                    continue
             update_relay(thread, status="failed", error=str(e)[:500])
             return
         live.close()
@@ -1017,7 +1097,11 @@ def cmd_work(ws: Workspace, args):
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
 
         if has_marker(reply, "【工作完成】"):
-            update_relay(thread, status="done")
+            relay = update_relay(thread, status="done")
+            warning = unverified_warning(relay)
+            if warning:
+                add_system_note(thread, f"⚠️ {denial_summary(relay)}。{warning}")
+                append_progress(thread, "工作完成，但接手期間有工具被拒", f"{denial_summary(relay)}。{warning}")
             return
         if has_marker(reply, "【已暫停】"):
             update_relay(thread, status="stopped")
@@ -1041,6 +1125,10 @@ def cmd_status(ws: Workspace, args):
     waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
     print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
           f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
+    if denial_summary(relay):
+        print(f"⚠️ {denial_summary(relay)}")
+    if unverified_warning(relay):
+        print(f"⚠️ {unverified_warning(relay)}")
     progress = relay_paths(thread)["progress"]
     if progress.exists():
         blocks = re.split(r"\n(?=## )", progress.read_text(encoding="utf-8"))
@@ -1274,7 +1362,8 @@ def activity(ws: Workspace) -> List[dict]:
                 items.append({"thread": thread.name, "topic": state["topic"], "type": "relay",
                               "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),
                               "waiting_until": relay.get("waiting_until"), "started": relay.get("started"),
-                              "pid": relay.get("pid"), "live": str(live) if live.exists() else None})
+                              "pid": relay.get("pid"), "live": str(live) if live.exists() else None,
+                              "denied": len(relay.get("denied") or []), "denied_summary": denial_summary(relay)})
             else:
                 update_relay(thread, status="interrupted")
     return items
@@ -1294,7 +1383,8 @@ def cmd_activity(ws: Workspace, args):
             print(f"💬 {it['thread']}｜{it['topic']}｜{it['kind']}｜{who}")
         else:
             wait = f"，等到 {quota.fmt_time(it['waiting_until'])}" if it.get("waiting_until") else ""
-            print(f"🛠 {it['thread']}｜{it['topic']}｜{NAMES[it['worker']]} 接手 {it['status']}{wait}｜已跑 {it['rounds']} 輪")
+            print(f"🛠 {it['thread']}｜{it['topic']}｜{NAMES[it['worker']]} 接手 {it['status']}{wait}｜已跑 {it['rounds']} 輪"
+                  + (f"｜⚠️ {it['denied_summary']}" if it.get("denied_summary") else ""))
 
 
 def cmd_keep(ws: Workspace, args):

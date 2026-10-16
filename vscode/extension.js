@@ -203,7 +203,10 @@ class ThreadsProvider {
     const parts = [];
     if (job) parts.push(job.current ? `${NAMES[job.current]} 回覆中 ${minutesSince(job.since)}` : "討論啟動中");
     parts.push(`${messages.length} 則`);
-    if (relay) parts.push(`${NAMES[relay.worker]} ${RELAY_LABELS[relay.status] || relay.status}`);
+    if (relay) {
+      const denied = (relay.denied || []).length;
+      parts.push(`${NAMES[relay.worker]} ${RELAY_LABELS[relay.status] || relay.status}${denied ? `（⚠ ${denied} 次工具被拒）` : ""}`);
+    }
     if (state.keep) parts.push("保留");
     item.description = parts.join(" · ");
     const active = relay && ACTIVE_RELAY.includes(relay.status);
@@ -258,6 +261,15 @@ class Activity {
   }
 }
 
+/** 「本次接手有 N 次工具被拒：read_url ×2」；沒有被拒時回傳空字串（與 cli.denial_summary 相同） */
+function deniedSummary(relay) {
+  const denied = relay.denied || [];
+  if (!denied.length) return "";
+  const counts = {};
+  for (const d of denied) counts[d.action || "unknown"] = (counts[d.action || "unknown"] || 0) + 1;
+  return `本次接手有 ${denied.length} 次工具被拒：` + Object.entries(counts).map(([a, n]) => `${a} ×${n}`).join("、");
+}
+
 function notifyFinished(item) {
   const thread = loadThreads().find((t) => t.id === item.thread);
   if (!thread) return;
@@ -274,8 +286,12 @@ function notifyFinished(item) {
       : `「${thread.state.topic}」的討論已完成。`;
   } else {
     const relay = thread.state.relay || {};
-    warn = relay.status !== "done";
+    const denied = deniedSummary(relay);
+    warn = relay.status !== "done" || !!denied;
     text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}。`;
+    if (denied) {
+      text += ` ⚠️ ${denied}` + (relay.status === "done" ? "，之後卻宣告完成，請查證結果的來源。" : "。");
+    }
   }
   const buttons = item.type === "relay" ? ["開啟逐字稿", "檢視變更"] : ["開啟逐字稿"];
   const shown = warn ? vscode.window.showWarningMessage(`Agora：${text}`, ...buttons)
@@ -628,7 +644,8 @@ function activate(context) {
     activityBar.text = `$(sync~spin) Agora ${items.length} 進行中`;
     activityBar.tooltip = "Agora 進行中（關閉視窗也會繼續）\n" + items.map((x) => x.type === "discussion"
       ? `💬 ${x.topic}：${x.current ? `${NAMES[x.current]} 回覆中（${minutesSince(x.since)}）` : "啟動中"}`
-      : `🛠 ${x.topic}：${NAMES[x.worker]} 接手${RELAY_LABELS[x.status] || x.status}，已跑 ${x.rounds} 輪`).join("\n");
+      : `🛠 ${x.topic}：${NAMES[x.worker]} 接手${RELAY_LABELS[x.status] || x.status}，已跑 ${x.rounds} 輪`
+        + (x.denied_summary ? `（⚠️ ${x.denied_summary}）` : "")).join("\n");
     activityBar.show();
   });
   context.subscriptions.push(activityBar);

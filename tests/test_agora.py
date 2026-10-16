@@ -1239,12 +1239,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.7")
+        self.assertEqual(__version__, "0.2.8")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.7", out.getvalue())
+        self.assertIn("0.2.8", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1570,6 +1570,76 @@ class TestBuildAndSandbox(unittest.TestCase):
             self.assertEqual(events, [{"locked": None, "invoked": "1"}])      # 外層殘留的不往下傳
             events, _ = parties._run([sys.executable, "-c", script], Path(tmp), "", 30, None, {parties.LOCKED_ENV: "x"})
             self.assertEqual(events, [{"locked": "x", "invoked": "1"}])
+
+    def test_denied_read_url_is_explained_recorded_and_flagged(self):
+        """Antigravity 讀網址被拒：重送的說明要針對 read_url、記錄被拒的動作，之後宣告完成時 status 要警告"""
+        url = "https://www.naer.edu.tw/upload/1/16/doc/2000.pdf"
+        prompts = []
+
+        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None, extra_env=None):
+            prompts.append(cmd[cmd.index("-p") + 1])
+            if len(prompts) <= 2:
+                events = [{"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE",
+                                                                   "tool_name": "read_url_content",
+                                                                   "tool_info": {"parameters": {"Url": url}}}},
+                          {"event": "result", "result": {"status": "SUCCESS", "response": "", "conversation_id": "c1",
+                                                         "denied_actions": [{"action": "read_url",
+                                                                             "display_name": "ReadUrlContent"}]}}]
+            else:
+                events = [{"event": "result", "result": {"status": "SUCCESS", "conversation_id": "c1",
+                                                         "response": "整理了 2118 筆\n【工作完成】"}}]
+            for event in events:
+                on_event(event)
+            return events, "jetski: no output produced — a tool required the \"read_url\" permission"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "antigravity"])
+            state["relay"] = {"worker": "antigravity", "from": "claude", "handoff": "從官方 PDF 整理字表",
+                              "rounds": 0, "status": "starting"}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            (thread / "progress.md").write_text("# 工作進度\n", encoding="utf-8")
+            with patch.object(parties, "_run", fake_run), patch.object(cli, "party_usage", return_value=None), \
+                    patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()), \
+                    patch("sys.stderr", io.StringIO()):
+                cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual(len(prompts), 3)
+            for retry in prompts[1:]:
+                self.assertIn("不在允許清單", retry)
+                self.assertIn("【已暫停】", retry)
+                self.assertIn("不要用記憶或其他來源替代", retry)
+                self.assertIn(url, retry)
+                self.assertNotIn("終端指令", retry)
+            self.assertEqual(relay["status"], "done")
+            self.assertEqual([(d["round"], d["action"], d["target"]) for d in relay["denied"]],
+                             [(1, "read_url", url), (1, "read_url", url)])
+            self.assertIn("工具被拒", (thread / "progress.md").read_text(encoding="utf-8"))
+            self.assertIn("請查證", (thread / "transcript.md").read_text(encoding="utf-8"))
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_status(ws, argparse.Namespace(thread="t1", wait=None, json=False))
+            self.assertIn("本次接手有 2 次工具被拒：read_url ×2", out.getvalue())
+            self.assertIn("宣告【工作完成】", out.getvalue())
+
+    def test_denial_notes_by_kind(self):
+        note = cli.denial_note_for([{"action": "command", "target": "rm -rf build"},
+                                    {"action": "write_file", "target": "C:/Windows/x"},
+                                    {"action": "mcp", "target": "mcp__db__query"},
+                                    {"action": "browse", "target": None}])
+        self.assertIn("未授權的終端指令（rm -rf build）", note)
+        self.assertIn("寫入檔案（C:/Windows/x）", note)
+        self.assertIn("MCP 工具（mcp__db__query）", note)
+        self.assertIn("（browse）被拒", note)
+        self.assertEqual(parties.claude_denials([{"tool_name": "WebFetch", "tool_input": {"url": "https://a.b/c"}},
+                                                 {"tool_name": "Bash", "tool_input": {"command": "ls -la"}},
+                                                 {"tool_name": "mcp__x__y", "tool_input": {}}]),
+                         [{"action": "read_url", "target": "https://a.b/c"}, {"action": "command", "target": "ls -la"},
+                          {"action": "mcp", "target": "mcp__x__y"}])
+        self.assertIsNone(cli.denial_summary({}))
 
     def test_work_preamble_mentions_build_only_when_configured(self):
         fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",

@@ -25,7 +25,7 @@
 只需要 Python 3.9 以上與這個擴充套件：
 
 ```bash
-code --install-extension agora-0.2.7.vsix     # 從 GitHub Release 下載
+code --install-extension agora-0.2.8.vsix     # 從 GitHub Release 下載
 ```
 
 擴充套件內建 Agora 核心（`agora.py`、`agoralib`、skills），啟動時同步到 `~/.agora/core`。

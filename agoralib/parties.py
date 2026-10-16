@@ -123,11 +123,53 @@ def quota_error(result, *texts: str) -> bool:
 
 class CallError(RuntimeError):
     def __init__(self, message: str, quota_exhausted: bool = False, denied: bool = False,
-                 session_id: Optional[str] = None):
+                 session_id: Optional[str] = None, denials: Optional[list] = None):
         super().__init__(message)
         self.quota_exhausted = quota_exhausted
-        self.denied = denied          # 有工具呼叫被權限拒絕（agy 非互動模式會因此整輪中斷）
+        # 被權限拒絕的工具呼叫 [{"action": 種類, "target": 網址、指令、路徑或 None}]（agy 非互動模式會因此整輪中斷）
+        self.denials = denials or ([{"action": "unknown", "target": None}] if denied else [])
+        self.denied = bool(self.denials)
         self.session_id = session_id  # 失敗的那段對話，重試時可以接續
+
+
+# ───────────────────────── 被拒的工具呼叫 ─────────────────────────
+
+CLAUDE_TOOL_ACTIONS = {"Bash": "command", "WebFetch": "read_url", "WebSearch": "web_search", "Read": "read_file",
+                       "Edit": "write_file", "Write": "write_file", "MultiEdit": "write_file", "NotebookEdit": "write_file"}
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def tool_target(params: dict) -> Optional[str]:
+    value = next((str(params[k]) for k in TOOL_KEYS if isinstance(params, dict) and params.get(k)), "")
+    value = " ".join(value.split())
+    return (value[:200] + ("…" if len(value) > 200 else "")) or None
+
+
+def agy_denials(denied: list, steps: list) -> list:
+    """Antigravity 的 denied_actions 只有種類（action、display_name），目標從同一輪最後一次同名的工具動作找"""
+    out = []
+    for d in denied or []:
+        if not isinstance(d, dict):
+            continue
+        names = {_norm(d.get("action")), _norm(d.get("display_name"))} - {""}
+        step = next((params for name, params in reversed(steps) if _norm(name) in names), None)
+        out.append({"action": d.get("action") or d.get("display_name") or "unknown",
+                    "target": tool_target(step or d)})
+    return out
+
+
+def claude_denials(denials: list) -> list:
+    out = []
+    for d in denials or []:
+        if not isinstance(d, dict):
+            continue
+        name = d.get("tool_name") or "unknown"
+        action = "mcp" if name.startswith("mcp__") else CLAUDE_TOOL_ACTIONS.get(name, name)
+        out.append({"action": action, "target": name if action == "mcp" else tool_target(d.get("tool_input") or {})})
+    return out
 
 
 # ───────────────────────── 進行中的回覆 ─────────────────────────
@@ -302,7 +344,16 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             cmd += ["--model", opts["model"]]
         if opts.get("effort"):
             cmd += ["--effort", opts["effort"]]
-        events, stderr = _run(cmd, workspace, None, timeout, live and (lambda e: antigravity_event(live, e)),
+        steps = []   # 這輪的工具動作（名稱, 參數），被拒時用來找出目標
+
+        def on_event(e):
+            step = e.get("step_update") or {}
+            if e.get("event") == "step_update" and step.get("step_type") == "tool" and step.get("state") == "ACTIVE":
+                steps.append((step.get("tool_name") or "", (step.get("tool_info") or {}).get("parameters") or {}))
+            if live:
+                antigravity_event(live, e)
+
+        events, stderr = _run(cmd, workspace, None, timeout, on_event,
                               {**(opts.get("env") or {}), SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
@@ -310,7 +361,8 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         if result.get("status") != "SUCCESS" or not reply:
             detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
             raise CallError(f"Antigravity 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
-                            denied=bool(result.get("denied_actions")), session_id=result.get("conversation_id"))
+                            denials=agy_denials(result.get("denied_actions"), steps),
+                            session_id=result.get("conversation_id"))
         meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
         return reply, result.get("conversation_id") or session_id, meta
     finally:
@@ -368,7 +420,7 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
     if result.get("is_error") or not reply:
         detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
         raise CallError(f"Claude 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
-                        denied=bool(result.get("permission_denials")), session_id=result.get("session_id"))
+                        denials=claude_denials(result.get("permission_denials")), session_id=result.get("session_id"))
     meta = f"{result.get('duration_ms', 0) / 1000:.0f}s, ${result.get('total_cost_usd', 0):.3f}"
     return reply, result.get("session_id") or session_id, meta
 
