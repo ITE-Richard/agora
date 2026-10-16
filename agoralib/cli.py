@@ -36,6 +36,7 @@ TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
 MAX_WORK_ROUNDS = int(os.getenv("AGORA_MAX_WORK_ROUNDS", "12"))
 QUOTA_BACKOFF = int(os.getenv("AGORA_QUOTA_BACKOFF", "900"))   # 回報額度用盡、但查不到重置時間時，等多久再試
+QUOTA_RETRIES = int(os.getenv("AGORA_QUOTA_RETRIES", "4"))     # 上述情況最多重試幾次，超過就判定失敗
 CONSENSUS = "【已達成共識】"
 
 PREAMBLE = """\
@@ -325,6 +326,18 @@ DENIED_RETRY = ("上一輪你使用了不被允許的工具或終端指令，整
                 "不要執行任何終端指令、不要修改檔案，然後直接回覆上面的訊息。")
 
 
+def call_party(party: str, *args, **kwargs):
+    """呼叫某一方的 CLI；帳務或權限錯誤時記下它暫時不能用，成功時清除這個標記"""
+    try:
+        result = CALLERS[party](*args, **kwargs)
+    except CallError as e:
+        if e.blocked:
+            quota.mark_blocked(party, str(e))
+        raise
+    quota.clear_blocked(party)
+    return result
+
+
 class CallFailed(SystemExit):
     """某一方沒有回覆（已寫進逐字稿）；send 會繼續請其他人回覆，其他指令照常結束"""
 
@@ -357,7 +370,7 @@ def invoke(ws: Workspace, thread: Path, party: str) -> str:
     for attempt in (1, 2):
         live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
         try:
-            reply, session_id, meta = CALLERS[party](prompt, session, opts, False, ws.root, TIMEOUT, thread, live=live)
+            reply, session_id, meta = call_party(party, prompt, session, opts, False, ws.root, TIMEOUT, thread, live=live)
             break
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
@@ -624,7 +637,7 @@ def cmd_summarize(ws: Workspace, args):
     jobs.set_current(party)
     live = Live(live_path(thread, "discussion"), f"{NAMES[party]}（總結）", ws.root)
     try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿；呼叫期間不持有 thread_lock（見 invoke）
-        reply, session_id, meta = CALLERS[party](prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
+        reply, session_id, meta = call_party(party, prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
     except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         live.close()
         add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
@@ -733,9 +746,14 @@ def pick_worker(ws: Workspace, owner: str, candidates: List[str]) -> str:
     if not others:
         sys.exit("沒有可自動分派的 AI（其他啟用中 AI 的分配比例都是 0），請用 --to 指定接手方。")
     usages = {p: quota.usage(p) for p in others}
+    usable = [p for p in others if not (usages[p] or {}).get("blocked")]
+    if not usable:
+        sys.exit("其他可自動分派的 AI 都標記為無法使用（" + "、".join(
+            f"{NAMES[p]}：{usages[p]['blocked']['reason']}" for p in others) + "）。處理後用 "
+            f"{agora_cmd()} quota --unblock <AI> 清除標記，或用 --to 指定接手方。")
     work = shares.recent_work(ws.root)
-    worker = shares.pick(others, weights, work, usages) \
-        or max(others, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
+    worker = shares.pick(usable, weights, work, usages) \
+        or max(usable, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
     total = sum(weights[p] for p in others)
     print(f"依分配比例挑選 {NAMES[worker]}（" + "、".join(
         f"{NAMES[p]} 目標 {int(weights[p] / total * 100 + 0.5)}% 近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪" for p in others) + "）")
@@ -754,6 +772,10 @@ def cmd_assign(ws: Workspace, args):
     else:
         text = read_message(args)
     worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
+    mark = quota.blocked(worker)
+    if mark:
+        print(f"⚠️ {NAMES[worker]} 在 {quota.fmt_time(mark.get('at'))} 被標記為無法使用（{mark.get('reason')}）；"
+              f"若問題還在，接手會立即停止並顯示原因。")
     old = state.get("relay") or {}
     if relay_alive(old):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
@@ -1033,7 +1055,7 @@ def cmd_work(ws: Workspace, args):
     log = lambda msg: print(f"[{now_str()}] {msg}", flush=True)  # noqa: E731
 
     # 輪數上限只算真正跑完的輪；等額度、被拒重試不算（等待有時間間隔，被拒重試另有上限，不會空轉）
-    denial_retries, denial_note, rounds = 0, "", relay.get("rounds", 0)
+    denial_retries, quota_retries, denial_note, rounds = 0, 0, "", relay.get("rounds", 0)
     while rounds < MAX_WORK_ROUNDS:
         if stop_requested(thread):
             update_relay(thread, status="stopped", waiting_until=None)
@@ -1077,8 +1099,8 @@ def cmd_work(ws: Workspace, args):
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
         try:
-            reply, session_id, meta = CALLERS[worker](prompt, relay.get("session_id"), opts,
-                                                      True, ws.root, WORK_TIMEOUT, thread, live=live)
+            reply, session_id, meta = call_party(worker, prompt, relay.get("session_id"), opts,
+                                                 True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
             guard_config(ws.root, config_before, thread, worker)
@@ -1091,14 +1113,31 @@ def cmd_work(ws: Workspace, args):
                     state = load_state(thread)
                     remember_session(state, worker, e.session_id, e.session_id == relay.get("external_session"))
                     save_state(thread, state)
+            if isinstance(e, CallError) and e.blocked:
+                # 帳務或權限問題（例如 workspace 沒有 credits）：等待也不會恢復，直接停下讓人處理
+                reason = quota.billing_reason(str(e))
+                msg = f"需要人工處理：{NAMES[worker]} {reason}"
+                update_relay(thread, status="blocked", waiting_until=None, error=str(e)[:500], blocked_reason=reason)
+                add_system_note(thread, f"⛔ {msg}。接手已停止；處理後請重新分派，或改派給其他 AI。")
+                append_progress(thread, msg, str(e)[:500])
+                log(msg)
+                return
             if exhausted or quota.low(party_usage(worker)):
                 quota.refresh(force=True)
                 if not quota.low(party_usage(worker)):
-                    # 判定額度用盡，但查到的額度看不出不足（快取過舊或查不到）：先等一段時間，不要立刻重試
+                    # 判定額度用盡，但查到的額度看不出不足（快取過舊或查不到）：先等一段時間，不要立刻重試；有次數上限
+                    quota_retries += 1
+                    if quota_retries > QUOTA_RETRIES:
+                        msg = f"{NAMES[worker]} 回報額度用盡 {quota_retries} 次，仍查不到重置時間，停止重試"
+                        update_relay(thread, status="failed", waiting_until=None, error=f"{msg}：{str(e)[:400]}")
+                        add_system_note(thread, f"⚠️ {msg}。請確認它的帳號狀態後重新分派，或改派給其他 AI。")
+                        append_progress(thread, msg, str(e)[:500])
+                        log(msg)
+                        return
                     wake = time.time() + QUOTA_BACKOFF
                     update_relay(thread, status="waiting", waiting_until=wake)
                     add_system_note(thread, f"⏸ {NAMES[worker]} 回報額度用盡，但查不到確切的重置時間，"
-                                            f"等到 {quota.fmt_time(wake)} 再試。")
+                                            f"等到 {quota.fmt_time(wake)} 再試（第 {quota_retries}/{QUOTA_RETRIES} 次）。")
                     sleep_until(thread, wake)
                 continue
             if isinstance(e, CallError) and e.denied:
@@ -1127,6 +1166,7 @@ def cmd_work(ws: Workspace, args):
             remember_session(state, worker, session_id, session_id == relay.get("external_session"))
             save_state(thread, state)
         rounds += 1
+        quota_retries = 0
         shares.record(ws.root, worker, thread.name)
         if before != changed:
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
@@ -1185,6 +1225,7 @@ def cmd_status(ws: Workspace, args):
                           "rounds": relay.get("rounds", 0), "timed_out": timed_out,
                           "waiting_until": relay.get("waiting_until"), "updated": relay.get("updated"),
                           "started": relay.get("started"), "error": relay.get("error"),
+                          "blocked_reason": relay.get("blocked_reason"),
                           "denied": relay.get("denied") or [], "denied_summary": denial_summary(relay),
                           "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
                           "exit_code": code}, ensure_ascii=False, indent=2))
@@ -1194,6 +1235,8 @@ def cmd_status(ws: Workspace, args):
         waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
         print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
               f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
+        if relay.get("status") == "blocked":
+            print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
             print(f"原因：{relay['error']}")
         for line in (denial_summary(relay), unverified_warning(relay)):
@@ -1360,6 +1403,9 @@ def cmd_show(ws: Workspace, args):
 
 
 def cmd_quota(ws: Workspace, args):
+    if args.unblock:
+        quota.main(["--unblock", canonical(args.unblock)])
+        return
     quota.main([f for f, on in (("--refresh", args.refresh), ("--json", args.json)) if on])
 
 
@@ -1462,13 +1508,29 @@ def activity(ws: Workspace) -> List[dict]:
     return items
 
 
+def blocked_relays(ws: Workspace) -> List[dict]:
+    """因帳務或權限問題停下、需要人工處理的分派"""
+    out = []
+    for thread in sorted(ws.threads.glob("*")) if ws.threads.exists() else []:
+        if (thread / "state.json").exists():
+            state = load_state(thread)
+            relay = state.get("relay") or {}
+            if relay.get("status") == "blocked":
+                out.append({"thread": thread.name, "topic": state["topic"], "worker": relay["worker"],
+                            "reason": relay.get("blocked_reason"), "updated": relay.get("updated")})
+    return out
+
+
 def cmd_activity(ws: Workspace, args):
     items = activity(ws)
     if args.json:
         print(json.dumps(items, ensure_ascii=False, indent=2))
         return
-    if not items:
+    blocked = blocked_relays(ws)
+    if not items and not blocked:
         print("目前沒有進行中的討論或分派。")
+    for it in blocked:
+        print(f"⛔ {it['thread']}｜{it['topic']}｜需要人工處理：{NAMES[it['worker']]} {it['reason']}（{it['updated']}）")
     for it in items:
         if it["type"] == "discussion":
             who = f"等待 {NAMES[it['current']]} 回覆（{int((time.time() - it['since']) / 60)} 分鐘）" \
@@ -1888,6 +1950,7 @@ def main(argv=None):
     p = sub.add_parser("quota", help="三方剩餘額度")
     p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--unblock", metavar="AI", help="清除某一方的「無法使用」標記（帳務或權限問題處理好之後）")
     p.set_defaults(func=cmd_quota)
 
     p = sub.add_parser("parties", help="查看或修改此專案參與的 AI、模型與推理強度")

@@ -42,6 +42,18 @@
 
   function quotaBar(u, threshold) {
     if (!u) return el("div", { class: "quota muted" }, state.quota ? "額度：無資料" : "額度：查詢中…");
+    if (u.blocked) {
+      return el("div", { class: "quota blocked", title: u.blocked.message || u.blocked.reason },
+        `⛔ 無法使用（${u.blocked.reason}，${fmtReset(u.blocked.at)} 偵測）`);
+    }
+    const group = quotaRows(u, threshold);
+    if (u.updated_at && Date.now() / 1000 - u.updated_at > 2 * 3600) {   // 與 quota.STALE_AFTER 相同
+      group.appendChild(el("div", { class: "quota muted" }, `資料 ${Math.floor((Date.now() / 1000 - u.updated_at) / 3600)} 小時前更新，可能過期`));
+    }
+    return group;
+  }
+
+  function quotaRows(u, threshold) {
     const winKeys = u.windows ? Object.keys(u.windows) : [];
     if (winKeys.length > 1) {
       const rows = winKeys.map((k) => {

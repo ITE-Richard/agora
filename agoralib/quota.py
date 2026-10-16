@@ -41,6 +41,8 @@ LS_SERVICE = "/exa.language_server_pb.LanguageServerService"
 PROCESS_NAMES = ("agy.exe", "language_server_windows_x64.exe", "language_server.exe")
 
 THRESHOLD_PCT = float(os.getenv("AGORA_QUOTA_THRESHOLD", "5"))
+STALE_AFTER = int(os.getenv("AGORA_QUOTA_STALE", "7200"))   # 額度資料超過這麼久沒更新就標示可能過期（秒）
+BLOCKED_FILE = AGORA_HOME / "blocked.json"   # 呼叫失敗判定為帳務或權限問題的一方：{party: {reason, message, at}}
 # Antigravity 內 Claude 系列與 Gemini 系列是獨立額度池；agy 預設用 Gemini
 AGY_POOL = os.getenv("AGORA_AGY_POOL", "gemini")
 PROBE_ENV = "AGORA_PROBE"
@@ -446,16 +448,80 @@ def fmt_time(ts) -> str:
     return dt.strftime("%H:%M") if dt.date() == datetime.now().date() else dt.strftime("%m/%d %H:%M")
 
 
+def age_text(updated_at) -> str:
+    """「N 分鐘前」；超過 STALE_AFTER 改用小時並標示可能過期"""
+    seconds = time.time() - (updated_at or 0)
+    minutes = int(seconds / 60)
+    text = f"{minutes} 分鐘前" if minutes < 120 else f"{minutes // 60} 小時前"
+    return text + ("，可能過期" if seconds > STALE_AFTER else "")
+
+
 def describe(name: str, usage: dict | None) -> str:
+    if usage and usage.get("blocked"):
+        b = usage["blocked"]
+        return f"{name}：無法使用（{b.get('reason')}，{fmt_time(b.get('at'))} 偵測）"
     if not usage:
         return f"{name}：無資料"
-    age = int((time.time() - (usage.get("updated_at") or 0)) / 60)
     win_tag = f"{usage['window_label']}，" if usage.get("window_label") and usage.get("window") else ""
-    return f"{name} 剩 {usage['remaining_pct']:.0f}%（{win_tag}{fmt_time(usage.get('resets_at'))} 重置，{age} 分鐘前）"
+    return (f"{name} 剩 {usage['remaining_pct']:.0f}%（{win_tag}{fmt_time(usage.get('resets_at'))} 重置，"
+            f"{age_text(usage.get('updated_at'))}）")
 
 
 def low(usage: dict | None) -> bool:
+    """速率或週期額度低於門檻（等重置就會恢復）"""
     return bool(usage) and usage["remaining_pct"] < THRESHOLD_PCT
+
+
+def unavailable(usage: dict | None) -> bool:
+    """不該分派給它：額度低於門檻，或被標記為帳務／權限問題（blocked）"""
+    return low(usage) or bool(usage and usage.get("blocked"))
+
+
+# ───────────────────────── 帳務或權限問題（blocked） ─────────────────────────
+
+def billing_reason(message: str) -> str:
+    """帳務或權限錯誤的簡短說明（顯示用）"""
+    m = (message or "").lower()
+    if "credit" in m:
+        return "workspace 沒有 credits" if "workspace" in m else "credits 已用完"
+    if "insufficient_quota" in m:
+        return "帳戶額度不足（insufficient_quota）"
+    if "billing" in m or "payment" in m:
+        return "帳務或付款問題"
+    if "subscription" in m:
+        return "訂閱問題"
+    return "帳務或權限問題"
+
+
+def blocked_all() -> dict:
+    return _read_json(BLOCKED_FILE) or {}
+
+
+def blocked(party: str) -> dict | None:
+    return blocked_all().get(party)
+
+
+def mark_blocked(party: str, message: str) -> dict:
+    """記下這一方暫時不能用（直到下一次成功呼叫，或 agora quota --unblock）"""
+    data = blocked_all()
+    data[party] = {"reason": billing_reason(message), "message": (message or "")[:500], "at": int(time.time())}
+    try:
+        _write_json(BLOCKED_FILE, data)
+    except OSError:
+        pass
+    return data[party]
+
+
+def clear_blocked(party: str) -> bool:
+    data = blocked_all()
+    if party not in data:
+        return False
+    data.pop(party)
+    try:
+        _write_json(BLOCKED_FILE, data)
+    except OSError:
+        return False
+    return True
 
 
 USAGE = {"claude": claude_usage, "antigravity": antigravity_usage, "codex": codex_usage}
@@ -463,15 +529,27 @@ LABELS = {"claude": "Claude", "antigravity": "Antigravity", "codex": "Codex"}
 
 
 def usage(party: str) -> dict | None:
-    return USAGE[party]()
+    """額度；被標記為帳務／權限問題時附上 blocked（額度數字仍照原來的來源，但這一方實際上不能用）"""
+    result = USAGE[party]()
+    mark = blocked(party)
+    if mark:
+        result = {**(result or {"remaining_pct": 0.0, "resets_at": None, "window": None, "window_label": None,
+                                "updated_at": mark.get("at")}), "blocked": mark}
+    return result
 
 
 def all_usage() -> dict:
-    return {p: f() for p, f in USAGE.items()}
+    return {p: usage(p) for p in USAGE}
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if "--unblock" in argv:
+        party = argv[argv.index("--unblock") + 1] if argv.index("--unblock") + 1 < len(argv) else ""
+        if party not in USAGE:
+            sys.exit(f"--unblock 要指定 {'、'.join(USAGE)} 其中之一。")
+        print(f"已清除 {LABELS[party]} 的無法使用標記。" if clear_blocked(party) else f"{LABELS[party]} 沒有無法使用標記。")
+        return
     if "--refresh" in argv:
         refresh(force=True)
         if "--quiet" in argv:
@@ -495,7 +573,10 @@ def main(argv=None):
                                for w in u["windows"].values())
             print(f"  各視窗明細：{details}")
     for party, u in usages.items():
-        if low(u):
+        if u and u.get("blocked"):
+            print(f"⛔ {LABELS[party]} 呼叫失敗需要人工處理：{u['blocked'].get('message') or u['blocked'].get('reason')}")
+            print(f"  處理後下一次成功呼叫會自動清除，或執行 agora quota --unblock {party}")
+        elif low(u):
             print(f"⚠️ {LABELS[party]} 低於 {THRESHOLD_PCT:.0f}%")
 
 

@@ -62,6 +62,7 @@ $A recall <id> [--wait [秒數]]                       # 請接手方停止；--
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
 $A quota [--refresh] [--json]                       # 三方剩餘額度
+$A quota --unblock codex                            # 清除「無法使用」標記（帳務或權限問題處理好之後）
 $A activity                                         # 所有進行中的討論與分派（誰正在回覆）
 $A wait <id>                                        # 接上背景進行中的討論，顯示回覆直到結束
 $A stop <id>                                        # 停止進行中的討論
@@ -128,7 +129,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 明確指定接手方時不受比例限制；`0` 表示只參與討論、不自動分派給它。
 
 - 工作量以**接手輪數**計：接手方每跑完一輪記一筆在 `.agora/work_log.jsonl`，統計最近 7 天（`AGORA_SHARE_DAYS`）；進行中的分派先算 1 輪。
-- 每次挑「再分一輪後占比仍最落後」的一方，也就是 `(輪數 + 1) / 比例` 最小者；額度低於門檻的跳過，大家都不足時退回挑額度最多的。
+- 每次挑「再分一輪後占比仍最落後」的一方，也就是 `(輪數 + 1) / 比例` 最小者；額度低於門檻或被標記無法使用的跳過，大家都不足時退回挑額度最多的（仍不挑無法使用的）。
 - 例如 Claude 5、Codex 3、Antigravity 2，十輪工作大約分成 5 / 3 / 2。
 
 | AI | 模型清單來源 | 推理強度 |
@@ -139,11 +140,19 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 ## 額度
 
-| AI | 來源 |
-|---|---|
-| Claude Code | 用 Haiku 發一個極短請求，讀回應的 `rate_limit_event`；Agora 呼叫 Claude 時也順便更新 |
-| Antigravity | 向執行中的 agy hub / language server（本機 loopback）呼叫 `GetUserStatus`，同 Quota Deck |
-| Codex | 讀 `~/.codex/sessions/**/rollout-*.jsonl` 最後一筆 `rate_limits`，不需額外請求 |
+| AI | 來源 | 數字代表什麼 |
+|---|---|---|
+| Claude Code | 用 Haiku 發一個極短請求，讀回應的 `rate_limit_event`；Agora 呼叫 Claude 時也順便更新 | 訂閱的 **5 小時**與 **7 天**使用視窗，顯示比較緊的那個 |
+| Antigravity | 向執行中的 agy hub / language server（本機 loopback）呼叫 `GetUserStatus`，同 Quota Deck | 各模型的 `quotaInfo.remainingFraction` 與重置時間，依額度池（Gemini、Claude）取最低的；週期由 Antigravity 決定 |
+| Codex | 讀 `~/.codex/sessions/**/rollout-*.jsonl` 最後一筆 `rate_limits`，不需額外請求 | ChatGPT 方案的 `primary`／`secondary` 速率視窗（通常是 **5 小時**與 **7 天**），顯示比較緊的那個 |
+
+- 這些都是**速率或週期額度**，用完會在重置時間恢復。**Codex 的 workspace credits 查不到**（它不在 `rate_limits` 裡）：credits 用完時額度仍可能顯示還有剩，只有實際呼叫失敗才知道。
+- Codex 的數字只在它執行過之後才會更新（讀它自己的紀錄）；很久沒用就會停在舊值。額度資料超過 2 小時（`AGORA_QUOTA_STALE`）沒更新時，顯示會改成「N 小時前，可能過期」。
+- 呼叫失敗的錯誤分兩類：
+  - **會自己恢復**的速率或週期額度（rate limit、429、usage limit、resets at…）：接手方等到重置時間再繼續；查不到重置時間時每 15 分鐘（`AGORA_QUOTA_BACKOFF`）重試，最多 4 次（`AGORA_QUOTA_RETRIES`），之後判定失敗。
+  - **需要人處理**的帳務或權限問題（out of credits、billing、payment、insufficient_quota、subscription、workspace owner…）：不等待也不重試。接手立刻停在 `blocked`，原始錯誤記在 `error`，進度檔、逐字稿、`status`、`activity` 都顯示「需要人工處理」。
+    同時把這一方標記為**無法使用**（`~/.agora/blocked.json`）：`agora quota`、hook、VSCode 都改顯示「Codex：無法使用（workspace 沒有 credits，07:04 偵測）」，自動分派與交接提醒也會跳過它。
+    標記在下一次成功呼叫它時自動清除，也可以處理好後用 `agora quota --unblock codex` 手動清除。
 
 快取在 `~/.agora/`。`agoralib/quota_hook.py` 是給 Claude Code（UserPromptSubmit、PostToolUse）與 Antigravity（PreInvocation）用的 hook：每次附上參與中 AI 的額度，自己低於 5% 時提醒把工作交給額度最多的一方。
 
@@ -213,6 +222,8 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | `AGORA_QUOTA_THRESHOLD` | 5（%） |
 | `AGORA_MAX_WORK_ROUNDS` | 12（接手方最多跑幾輪；等額度、被拒重試不算） |
 | `AGORA_QUOTA_BACKOFF` | 900 秒（接手方回報額度用盡、但查不到重置時間時，等多久再試） |
+| `AGORA_QUOTA_RETRIES` | 4（上述情況最多重試幾次，超過就判定失敗） |
+| `AGORA_QUOTA_STALE` | 7200 秒（額度資料超過這麼久沒更新，顯示可能過期） |
 | `AGORA_AGY_POOL` | gemini（Antigravity 內 Gemini 與 Claude 模型是不同額度池） |
 
 工作區的 `.agora/config.json` 可設定：

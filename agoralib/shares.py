@@ -58,8 +58,8 @@ def recent_work(root: Path, days: float = SHARE_DAYS, include_active: bool = Tru
 
 def pick(candidates: Iterable[str], shares: Dict[str, int], work: Dict[str, int],
          usages: Dict[str, Optional[dict]]) -> Optional[str]:
-    """在 candidates 中依比例挑一方；額度不足或比例為 0 的不挑，沒有人可挑時回傳 None"""
-    eligible = [p for p in candidates if shares.get(p, 1) > 0 and not quota.low(usages.get(p))]
+    """在 candidates 中依比例挑一方；額度不足、被標記無法使用（blocked）或比例為 0 的不挑，沒有人可挑時回傳 None"""
+    eligible = [p for p in candidates if shares.get(p, 1) > 0 and not quota.unavailable(usages.get(p))]
     if not eligible:
         return None
     return min(eligible, key=lambda p: ((work.get(p, 0) + 1) / shares.get(p, 1), -shares.get(p, 1),

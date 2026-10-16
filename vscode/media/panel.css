@@ -58,6 +58,10 @@ select {
   font: inherit;
 }
 
+.quota.blocked {
+  color: var(--vscode-errorForeground);
+}
+
 .quota-group {
   display: flex;
   flex-direction: column;

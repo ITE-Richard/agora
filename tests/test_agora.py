@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agoralib import cli, config, jobs, parties, prune, quota, quota_hook, shares, snapshot  # noqa: E402
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
+# 測試不能動到使用者真正的「無法使用」標記（~/.agora/blocked.json）
+quota.BLOCKED_FILE = Path(tempfile.mkdtemp()) / "blocked.json"
+
 
 def state_with(parties, messages=()):
     return {"topic": "t", "parties": {p: {"session_id": None, "seen": 0, "model": None} for p in parties},
@@ -1355,12 +1358,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.9")
+        self.assertEqual(__version__, "0.2.10")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.9", out.getvalue())
+        self.assertIn("0.2.10", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1664,6 +1667,85 @@ class TestBuildAndSandbox(unittest.TestCase):
         self.assertEqual(relay["status"], "max_rounds")
         self.assertEqual(relay["rounds"], 2)              # 等待不算輪數：仍跑滿 2 輪
         self.assertEqual(len(calls), 5)
+
+    CREDITS = '{"type":"error","message":"Your workspace is out of credits. Ask your workspace owner to refill in order to continue."}'
+
+    def test_error_kinds(self):
+        self.assertEqual(parties.error_kind([json.loads(self.CREDITS)]), "billing")
+        self.assertEqual(parties.error_kind(None, "Error: insufficient_quota"), "billing")
+        self.assertEqual(parties.error_kind(None, "billing hard limit reached"), "billing")
+        self.assertEqual(parties.error_kind({"result": "Claude AI usage limit reached|1760000000"}), "quota")
+        self.assertEqual(parties.error_kind(None, "HTTP 429 Too Many Requests"), "quota")
+        self.assertEqual(parties.error_kind(None, "rate limit exceeded, resets at 12:00"), "quota")
+        self.assertIsNone(parties.error_kind({"session_id": "a4291c", "result": "boom"}))
+        e = parties.call_error("Codex 未產生回覆", [json.loads(self.CREDITS)], "")
+        self.assertEqual((e.blocked, e.quota_exhausted), (True, False))
+
+    def test_out_of_credits_blocks_once_and_marks_party(self):
+        calls = []
+
+        def codex(*a, **k):
+            calls.append(1)
+            raise parties.call_error(f"Codex 未產生回覆：{self.CREDITS}", [json.loads(self.CREDITS)])
+
+        quota.clear_blocked("codex")
+        cached = {"remaining_pct": 18.0, "resets_at": None, "window": "secondary", "window_label": "7 天",
+                  "updated_at": time.time() - 433 * 60}   # 額度快取一連數小時沒變，仍顯示剩 18%
+        with patch.dict(quota.USAGE, {"codex": lambda: dict(cached)}):
+            relay, sleeps = self.run_worker(codex, usage={"remaining_pct": 18.0})
+            self.assertEqual(len(calls), 1)                  # 不等待、不重試
+            self.assertEqual(sleeps, [])
+            self.assertEqual(relay["status"], "blocked")
+            self.assertEqual(relay["blocked_reason"], "workspace 沒有 credits")
+            self.assertIn("out of credits", relay["error"])
+            mark = quota.blocked("codex")
+            self.assertEqual(mark["reason"], "workspace 沒有 credits")
+            usage = quota.usage("codex")
+            self.assertTrue(quota.unavailable(usage))
+            self.assertFalse(quota.low(usage))
+            self.assertTrue(quota.describe("Codex", usage).startswith("Codex：無法使用（workspace 沒有 credits，"))
+            self.assertIsNone(shares.pick(["codex"], {"codex": 1}, {}, {"codex": usage}))
+            out = io.StringIO()
+            with patch("sys.stdout", out), patch.object(quota, "claude_usage", return_value=None), \
+                    patch.object(quota, "antigravity_usage", return_value=None):
+                quota.main(["--json"])
+            self.assertEqual(json.loads(out.getvalue())["codex"]["blocked"]["reason"], "workspace 沒有 credits")
+            # 下一次成功呼叫就自動清除
+            with patch.dict(cli.CALLERS, {"codex": lambda *a, **k: ("好", "s", "1s")}):
+                cli.call_party("codex", "p", None, {}, False, Path("."), 1, Path("."))
+            self.assertIsNone(quota.blocked("codex"))
+            self.assertEqual(quota.describe("Codex", quota.usage("codex")), "Codex 剩 18%（7 天，未知 重置，7 小時前，可能過期）")
+
+    def test_blocked_relay_shown_in_status_and_activity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex"])
+            state["relay"] = {"worker": "codex", "from": "claude", "handoff": "做事", "rounds": 0, "status": "blocked",
+                              "blocked_reason": "workspace 沒有 credits", "error": "out of credits"}
+            cli.save_state(thread, state)
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_activity(ws, argparse.Namespace(json=False))
+                with self.assertRaises(SystemExit) as cm:
+                    cli.cmd_status(ws, argparse.Namespace(thread="t1", wait=5, json=False))
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("⛔ t1｜t｜需要人工處理：Codex workspace 沒有 credits", out.getvalue())
+            self.assertIn("⛔ 需要人工處理：Codex workspace 沒有 credits", out.getvalue())
+
+    def test_quota_retries_are_limited_when_reset_unknown(self):
+        calls = []
+
+        def codex(*a, **k):
+            calls.append(1)
+            raise parties.CallError("rate limit", quota_exhausted=True)
+
+        relay, sleeps = self.run_worker(codex)
+        self.assertEqual(len(sleeps), cli.QUOTA_RETRIES)
+        self.assertEqual(len(calls), cli.QUOTA_RETRIES + 1)
+        self.assertEqual(relay["status"], "failed")
+        self.assertIn("仍查不到重置時間", relay["error"])
 
     def test_command_config_reads_locked_env(self):
         with tempfile.TemporaryDirectory() as tmp:

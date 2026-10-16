@@ -53,7 +53,11 @@ NO_SUBAGENT_NOTE = "（使用者設定：這次不要使用你內建的子代理
 DIST_NAME = "agora-cli"
 NESTED_ENV = "AGORA_INVOKED"
 LOCKED_ENV = "AGORA_LOCKED_COMMANDS"   # 接手方執行 agora build / check 時用的指令（分派當輪開始時的設定）
-QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|\b429\b|resource_exhausted|credits", re.I)
+# 會自己恢復的速率／週期額度（等重置）與需要人處理的帳務或權限（等也不會好）；後者優先判斷（insufficient_quota 也含 quota）
+QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|\b429\b|resource_exhausted|too many requests|resets? at",
+                         re.I)
+BILLING_ERROR = re.compile(r"out of credits|\bcredits?\b|billing|payment|insufficient_quota|subscription|workspace owner",
+                           re.I)
 NOISE_KEYS = re.compile(r"(^|_)id$|Id$|uuid|usage|duration|cost|tokens", re.I)
 
 HUMAN = "human"
@@ -109,27 +113,43 @@ def canonical(name: str) -> str:
     return ALIASES.get(name, name)
 
 
-def quota_error(result, *texts: str) -> bool:
-    """錯誤是否為額度用盡：只比對錯誤訊息，略過 result 裡的 ID、用量、耗時等欄位（UUID 與數字常剛好含 429）"""
+def error_kind(result, *texts: str) -> Optional[str]:
+    """失敗的種類："billing"（帳務、credits、權限，要人處理）、"quota"（速率或週期額度，會自己恢復）或 None。
+    只比對錯誤訊息，略過 result 裡的 ID、用量、耗時等欄位（UUID 與數字常剛好含 429）"""
     def strip(x):
         if isinstance(x, dict):
             return {k: strip(v) for k, v in x.items() if not NOISE_KEYS.search(str(k))}
         if isinstance(x, list):
             return [strip(v) for v in x]
         return x
-    text = json.dumps(strip(result), ensure_ascii=False) if result is not None else ""
-    return bool(QUOTA_ERROR.search("\n".join([text, *texts])))
+    text = "\n".join([json.dumps(strip(result), ensure_ascii=False) if result is not None else "", *texts])
+    if BILLING_ERROR.search(text):
+        return "billing"
+    if QUOTA_ERROR.search(text):
+        return "quota"
+    return None
+
+
+def quota_error(result, *texts: str) -> bool:
+    return error_kind(result, *texts) == "quota"
 
 
 class CallError(RuntimeError):
     def __init__(self, message: str, quota_exhausted: bool = False, denied: bool = False,
-                 session_id: Optional[str] = None, denials: Optional[list] = None):
+                 session_id: Optional[str] = None, denials: Optional[list] = None, blocked: bool = False):
         super().__init__(message)
-        self.quota_exhausted = quota_exhausted
+        self.quota_exhausted = quota_exhausted   # 速率或週期額度用盡：等重置後再試
+        self.blocked = blocked                   # 帳務或權限問題（例如 workspace 沒有 credits）：要人處理，不重試
         # 被權限拒絕的工具呼叫 [{"action": 種類, "target": 網址、指令、路徑或 None}]（agy 非互動模式會因此整輪中斷）
         self.denials = denials or ([{"action": "unknown", "target": None}] if denied else [])
         self.denied = bool(self.denials)
         self.session_id = session_id  # 失敗的那段對話，重試時可以接續
+
+
+def call_error(message: str, result, *texts: str, **kwargs) -> CallError:
+    """依錯誤訊息分類的 CallError"""
+    kind = error_kind(result, *texts)
+    return CallError(message, quota_exhausted=kind == "quota", blocked=kind == "billing", **kwargs)
 
 
 # ───────────────────────── 被拒的工具呼叫 ─────────────────────────
@@ -296,7 +316,7 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
             events = [json.loads(stdout)]
         except json.JSONDecodeError:
             detail = f"(exit={proc.returncode})\n{stdout[-1500:]}\n{stderr[-1500:]}"
-            raise CallError(f"無法解析輸出 {detail}", quota_error(None, detail))
+            raise call_error(f"無法解析輸出 {detail}", None, detail)
     return events, stderr
 
 
@@ -360,9 +380,9 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         reply = (result.get("response") or "").strip()
         if result.get("status") != "SUCCESS" or not reply:
             detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-            raise CallError(f"Antigravity 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
-                            denials=agy_denials(result.get("denied_actions"), steps),
-                            session_id=result.get("conversation_id"))
+            raise call_error(f"Antigravity 未產生回覆：{detail}", result, stderr[-500:],
+                             denials=agy_denials(result.get("denied_actions"), steps),
+                             session_id=result.get("conversation_id"))
         meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
         return reply, result.get("conversation_id") or session_id, meta
     finally:
@@ -419,8 +439,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
     reply = (result.get("result") or "").strip()
     if result.get("is_error") or not reply:
         detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-        raise CallError(f"Claude 未產生回覆：{detail}", quota_error(result, stderr[-500:]),
-                        denials=claude_denials(result.get("permission_denials")), session_id=result.get("session_id"))
+        raise call_error(f"Claude 未產生回覆：{detail}", result, stderr[-500:],
+                         denials=claude_denials(result.get("permission_denials")), session_id=result.get("session_id"))
     meta = f"{result.get('duration_ms', 0) / 1000:.0f}s, ${result.get('total_cost_usd', 0):.3f}"
     return reply, result.get("session_id") or session_id, meta
 
@@ -474,7 +494,7 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
     reply = (messages[-1] if messages else "").strip()
     if errors or not reply:
         detail = "；".join(errors)[:1500] + stderr[-500:]
-        raise CallError(f"Codex 未產生回覆：{detail}", quota_error(failures, stderr[-500:]), session_id=thread_id)
+        raise call_error(f"Codex 未產生回覆：{detail}", failures, stderr[-500:], session_id=thread_id)
     usage = next((e.get("usage") for e in reversed(events) if e.get("type") == "turn.completed"), {}) or {}
     meta = f"{usage.get('input_tokens', '?')}+{usage.get('output_tokens', '?')} tokens"
     if not allow_subagents and any((e.get("item") or {}).get("type") == "collab_tool_call" for e in events):

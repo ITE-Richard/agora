@@ -43,7 +43,7 @@ def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None
         return f"worker-{mine.get('resets_at')}", (
             f"⚠️ 你（{NAMES[me]}）的額度剩 {mine['remaining_pct']:.0f}%。完成目前這一小步後，"
             f"把交接說明寫進進度檔，回覆最後一行寫「【額度不足】」並結束。")
-    others = {p: u for p, u in usages.items() if p != me and u and weights.get(p, 1) > 0}
+    others = {p: u for p, u in usages.items() if p != me and u and weights.get(p, 1) > 0 and not u.get("blocked")}
     my_reset = mine.get("resets_at")
     if not others:
         return f"none-{my_reset}", (

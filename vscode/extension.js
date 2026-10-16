@@ -15,7 +15,7 @@ const SHORT = { claude: "Claude", antigravity: "Agy", codex: "Codex" };
 const ACTIVE_RELAY = ["starting", "running", "waiting"];
 const RELAY_LABELS = {
   starting: "啟動中", running: "執行中", waiting: "等額度重置", done: "已完成", stopped: "已暫停",
-  failed: "失敗", max_rounds: "已達最大輪數",
+  failed: "失敗", max_rounds: "已達最大輪數", blocked: "需要人工處理", interrupted: "已中斷",
 };
 
 let output;
@@ -288,7 +288,8 @@ function notifyFinished(item) {
     const relay = thread.state.relay || {};
     const denied = deniedSummary(relay);
     warn = relay.status !== "done" || !!denied;
-    text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}。`;
+    text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}`
+      + (relay.blocked_reason ? `（${relay.blocked_reason}）` : "") + "。";
     if (denied) {
       text += ` ⚠️ ${denied}` + (relay.status === "done" ? "，之後卻宣告完成，請查證結果的來源。" : "。");
     }
@@ -507,8 +508,16 @@ class Model {
   }
 }
 
+const STALE_AFTER = 2 * 3600;   // 與 quota.STALE_AFTER 相同：超過就標示可能過期
+
 function quotaText(u, { multiline = false } = {}) {
   if (!u) return "無資料";
+  const text = quotaBody(u, multiline);
+  return u.blocked || !u.updated_at || Date.now() / 1000 - u.updated_at <= STALE_AFTER ? text
+    : text.replace(/\n|$/, "（資料可能過期）$&");
+}
+
+function quotaBody(u, multiline) {
   const fmt = (ts) => {
     if (!ts) return "未知";
     const d = new Date(ts * 1000);
@@ -517,6 +526,7 @@ function quotaText(u, { multiline = false } = {}) {
       : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
   };
 
+  if (u.blocked) return `無法使用（${u.blocked.reason}，${fmt(u.blocked.at)} 偵測）`;
   const winKeys = u.windows ? Object.keys(u.windows) : [];
   if (winKeys.length > 1) {
     if (multiline) {
@@ -662,10 +672,10 @@ function activate(context) {
     const threshold = model.quota.threshold_pct || 5;
     statusBar.text = "$(organization) " + enabled.map((p) => {
       const u = model.quota[p];
-      const pct = u ? `${Math.round(u.remaining_pct)}%` : "?";
+      const pct = !u ? "?" : u.blocked ? "✕" : `${Math.round(u.remaining_pct)}%`;
       return `${SHORT[p]} ${pct}`;
     }).join(" · ");
-    const low = enabled.some((p) => model.quota[p] && model.quota[p].remaining_pct < threshold);
+    const low = enabled.some((p) => model.quota[p] && (model.quota[p].blocked || model.quota[p].remaining_pct < threshold));
     statusBar.backgroundColor = low ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
     statusBar.tooltip = "Agora 額度\n" + enabled.map((p) => `${NAMES[p]}：${quotaText(model.quota[p], { multiline: true })}`).join("\n");
     statusBar.show();
