@@ -19,7 +19,9 @@ from agoralib import cli, config, jobs, parties, prune, quota, quota_hook, share
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
 # 測試不能動到使用者真正的「無法使用」標記（~/.agora/blocked.json）
-quota.BLOCKED_FILE = Path(tempfile.mkdtemp()) / "blocked.json"
+_TEST_HOME = Path(tempfile.mkdtemp())
+quota.BLOCKED_FILE = _TEST_HOME / "blocked.json"
+cli.INSTALL_WRITES = _TEST_HOME / "install_writes.jsonl"
 
 
 def state_with(parties, messages=()):
@@ -381,7 +383,7 @@ class TestSnapshot(unittest.TestCase):
             out = io.StringIO()
             with patch("sys.stdout", out):
                 cli.cmd_changes(ws, type("Args", (), {"thread": "t1", "json": True})())
-            self.assertEqual(json.loads(out.getvalue())["files"], [{"status": "A", "path": "new.txt"}])
+            self.assertEqual(json.loads(out.getvalue())["files"], [{"status": "A", "path": "new.txt", "agora_update": False}])
             prune.delete_thread(thread, {"sessions": []}, with_sessions=False)
             self.assertEqual(subprocess.run(["git", "rev-parse", "--verify", "-q", "refs/agora/t1"], cwd=root,
                                             capture_output=True).returncode, 1)
@@ -834,7 +836,7 @@ class TestInstall(unittest.TestCase):
             shutil.copytree(cli.AGORA_ROOT_DIR / "skills", custom_root / "skills")
             (custom_root / "agoralib").mkdir()
             with patch.object(Path, "home", return_value=Path(home)), patch.object(cli, "AGORA_ROOT_DIR", custom_root), \
-                    patch.object(parties, "_CMD", parties.LEGACY_CMD):
+                    patch.object(parties, "_CMD", parties.LEGACY_CMD), patch.object(cli.shutil, "which", return_value=None):
                 cli.cmd_install(cli.Workspace(Path(tmp)), None)
             quoted = f'python "{custom_root.as_posix()}/agora.py"'
             skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
@@ -844,6 +846,82 @@ class TestInstall(unittest.TestCase):
             allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
                                .read_text(encoding="utf-8"))["permissions"]["allow"]
             self.assertIn(f"command({quoted} quota)", allow)
+
+    def install(self, ws, home):
+        out = io.StringIO()
+        with patch.object(Path, "home", return_value=Path(home)), patch("sys.stdout", out), \
+                patch.dict(os.environ), patch.object(parties, "_CMD", "agora"):
+            os.environ.pop(parties.NESTED_ENV, None)
+            cli.cmd_install(ws, None)
+        return out.getvalue()
+
+    def test_reinstall_without_changes_touches_nothing_and_logs_changes(self):
+        """模擬升級前後各 install 一次：內容沒變就不改檔（換行字元不同也不算）；有變更時記錄改了哪些檔案"""
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            ws = cli.Workspace(Path(tmp))
+            (ws.root / "AGENTS.md").write_text("# 專案說明\n", encoding="utf-8")
+            self.assertTrue(self.install(ws, home).startswith(f"Agora {cli.__version__} 更新了"))
+            agents = ws.root / "AGENTS.md"
+            agents.write_bytes(agents.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))   # 使用者的編輯器改成 CRLF
+            tracked = [agents, ws.root / ".claude" / "skills" / "agora" / "SKILL.md", ws.root / ".agents" / "hooks.json",
+                       ws.root / ".claude" / "settings.local.json", Path(home) / ".gemini" / "antigravity-cli" / "settings.json"]
+            before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tracked}
+            out = self.install(ws, home)
+            self.assertTrue(out.startswith(f"Agora {cli.__version__}：此專案的 Agora 檔案都是最新，沒有改動任何檔案。"), out)
+            self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tracked}, before)
+
+            # 「升級」：skill 是舊版內容 → 只改它，紀錄寫進 .agora/install.log
+            skill = ws.root / ".claude" / "skills" / "agora" / "SKILL.md"
+            skill.write_text("舊版的 skill\n", encoding="utf-8")
+            out = self.install(ws, home)
+            self.assertTrue(out.startswith(f"Agora {cli.__version__} 更新了 1 個檔案：.claude/skills/agora/SKILL.md"), out)
+            self.assertEqual(agents.read_bytes(), before[agents][0])           # CRLF 保留，沒有被改寫
+            log = (ws.root / ".agora" / "install.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(log), 3)
+            self.assertIn("沒有改動任何檔案", log[1])
+            self.assertIn("更新了：.claude/skills/agora/SKILL.md", log[2])
+
+    def test_worker_guard_keeps_files_written_by_install(self):
+        """接手期間 agora install 改寫的 hook 標成 Agora 自動更新、不還原；接手方自己改的照樣還原"""
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.root / "thread"
+            thread.mkdir()
+            self.install(ws, home)
+            hooks = ws.root / ".agents" / "hooks.json"
+            data = json.loads(hooks.read_text(encoding="utf-8"))
+            data.pop("agora-subagents")                                      # 升級前的舊版 hook
+            hooks.write_text(json.dumps(data), encoding="utf-8")
+            before, since = cli.protected_files(ws.root), time.time()
+            self.install(ws, home)                                             # 接手期間使用者按了「更新」
+            upgraded = hooks.read_bytes()
+            self.assertEqual(cli.guard_files(ws.root, before, thread, "codex", since), [])
+            self.assertEqual(hooks.read_bytes(), upgraded)
+            self.assertIn("Agora 自動更新", (thread / "transcript.md").read_text(encoding="utf-8"))
+
+            before, since = cli.protected_files(ws.root), time.time()
+            hooks.write_text('{"evil": true}', encoding="utf-8")              # 接手方自己改的
+            self.assertEqual(cli.guard_files(ws.root, before, thread, "codex", since), [".agents/hooks.json"])
+            self.assertEqual(hooks.read_bytes(), upgraded)
+
+    def test_agents_md_command_is_stable(self):
+        """PATH 上有 agora 就固定寫 agora（不論由哪一份 Agora 執行 install）；沒有時寫完整路徑並在區段內註明"""
+        with patch.object(parties, "_CMD", parties.LEGACY_CMD):
+            with patch.object(cli.shutil, "which", return_value="C:/x/agora.exe"):
+                plan = cli.install_plan()
+                self.assertEqual(plan["cmd"], "agora")
+                self.assertNotIn(cli.LEGACY_NOTE, cli.agents_section(plan))
+            with patch.object(cli.shutil, "which", return_value=None):
+                plan = cli.install_plan()
+                self.assertEqual(plan["cmd"], plan["legacy"])
+                section = cli.agents_section(plan)
+                self.assertTrue(section.startswith("<!-- agora:begin -->\n" + cli.LEGACY_NOTE))
+
+    def test_worker_cannot_run_install(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {parties.NESTED_ENV: "1"}):
+            with self.assertRaises(SystemExit):
+                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+            self.assertFalse((Path(tmp) / ".claude").exists())
 
     def test_quote_path(self):
         self.assertEqual(parties.quote_path("D:/github/agora/agora.py"), "D:/github/agora/agora.py")
@@ -1358,12 +1436,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.11")
+        self.assertEqual(__version__, "0.2.12")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.11", out.getvalue())
+        self.assertIn("0.2.12", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

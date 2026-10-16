@@ -830,6 +830,9 @@ def cmd_changes(ws: Workspace, args):
         files = snapshot.changes(ws.root, base["commit"])
     except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
         sys.exit(str(e))
+    writes = agora_writes(ws.root, relay_started_ts(relay))
+    for f in files:
+        f["agora_update"] = f["status"] != "D" and written_by_agora(ws.root, f["path"], writes)
     if args.json:
         print(json.dumps({"baseline": base["commit"], "ref": base.get("ref"), "since": relay.get("started"),
                           "worker": relay.get("worker"), "status": relay.get("status"), "files": files},
@@ -840,7 +843,7 @@ def cmd_changes(ws: Workspace, args):
     if not files:
         print("  沒有變更。")
     for f in files:
-        print(f"  {snapshot.STATUS.get(f['status'], f['status'])}  {f['path']}")
+        print(f"  {snapshot.STATUS.get(f['status'], f['status'])}  {f['path']}" + ("（Agora 自動更新）" if f["agora_update"] else ""))
     if files:
         print(f"\n查看內容：git diff {base['commit'][:12]} -- <檔案>（未追蹤的新檔不在 git diff 內）")
 
@@ -1024,10 +1027,17 @@ def protected_files(root: Path) -> dict:
     return out
 
 
-def guard_files(root: Path, before: dict, thread: Path, worker: str) -> List[str]:
-    """接手一輪結束後，受保護的檔案被新增、修改或刪除就還原，並記在逐字稿"""
+def guard_files(root: Path, before: dict, thread: Path, worker: str, since: Optional[float] = None) -> List[str]:
+    """接手一輪結束後，受保護的檔案被新增、修改或刪除就還原，並記在逐字稿。
+    這輪期間 agora install 寫入的（內容與 install 記下的雜湊相同）標成「Agora 自動更新」，不還原、不算接手方的改動"""
     after = protected_files(root)
     changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    writes = agora_writes(root, since) if since else {}
+    updated = [k for k in changed if after.get(k) is not None and written_by_agora(root, k, writes)]
+    if updated:
+        add_system_note(thread, f"ℹ️ 這輪期間 agora install 更新了 {'、'.join(updated)}"
+                                f"（Agora 自動更新，不是 {NAMES[worker]} 的改動，已保留）。")
+    changed = [k for k in changed if k not in updated]
     for key in changed:
         path = Path(key) if Path(key).is_absolute() else root / key
         try:
@@ -1094,7 +1104,7 @@ def cmd_work(ws: Workspace, args):
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
         config_before = read_config_text(ws.root)
-        files_before = protected_files(ws.root)
+        files_before, round_ts = protected_files(ws.root), time.time()
         opts = call_opts(ws, state, worker)
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
@@ -1104,7 +1114,7 @@ def cmd_work(ws: Workspace, args):
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
             guard_config(ws.root, config_before, thread, worker)
-            guard_files(ws.root, files_before, thread, worker)
+            guard_files(ws.root, files_before, thread, worker, round_ts)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
@@ -1156,7 +1166,7 @@ def cmd_work(ws: Workspace, args):
             return
         live.close()
         guard_config(ws.root, config_before, thread, worker)
-        guard_files(ws.root, files_before, thread, worker)
+        guard_files(ws.root, files_before, thread, worker, round_ts)
         changed = git_status(ws.root)
 
         with thread_lock(thread, wait=WORKER_LOCK_WAIT):
@@ -1686,17 +1696,39 @@ def cmd_models(ws: Workspace, args):
             print(f"  ⚠️ {c['error']}")
 
 
-def _merge_json(path: Path, update) -> dict:
+def _normalized(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").strip().split("\n"))
+
+
+def write_if_changed(path: Path, text: str) -> bool:
+    """內容有實質變化才寫入（換行字元、行尾空白不算），寫入時沿用檔案原本的換行字元；回傳是否寫入"""
+    try:
+        old = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        old = None
+    if old is not None and _normalized(old) == _normalized(text):
+        return False
+    text = text.replace("\r\n", "\n")
+    if old is not None and "\r\n" in old:
+        text = text.replace("\n", "\r\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))
+    return True
+
+
+def _merge_json(path: Path, update) -> bool:
+    """讀出 JSON、交給 update 修改，有變化才寫回；回傳是否寫入"""
     data = {}
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             sys.exit(f"{path} 不是合法的 JSON，請先修正。")
+    before = json.dumps(data, sort_keys=True)
     update(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return data
+    if path.exists() and json.dumps(data, sort_keys=True) == before:
+        return False
+    return write_if_changed(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 SKILL_ROOT = "D:/github/agora"   # skills 範本裡的 Agora 位置，install 時換成實際位置或 agora 指令
@@ -1706,14 +1738,28 @@ SKILL_DIRS = (("claude", Path(".claude") / "skills"), ("antigravity", Path(".age
 
 
 def install_plan() -> dict:
-    """install 要寫入的指令：hook、舊式路徑指令、給 AI 用的指令（有 editable 的 agora 時用它）"""
+    """install 要寫入的指令：hook、舊式路徑指令、給 AI 用的指令。
+    給 AI 用的指令只要 PATH 上有 agora 就固定寫 agora：不論這次是擴充套件內建的核心還是 pip install -e 的那份執行 install，
+    寫進 skills 與 AGENTS.md 的內容都一樣，不會因為換了執行者而來回改動。PATH 上沒有 agora 時才寫完整路徑"""
     root = AGORA_ROOT_DIR
     legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
     hook_file = root / "agoralib" / "quota_hook.py"
     return {"root": root, "legacy": legacy,
             "hook": f"python {quote_path(hook_file.as_posix())}",
             "agy_hook": f"python {no_space_path(hook_file)}",   # Antigravity 執行 hook 時不處理引號
-            "cmd": agora_cmd() if agora_cmd() == "agora" else legacy}
+            "cmd": "agora" if agora_cmd() == "agora" or shutil.which("agora") else legacy}
+
+
+LEGACY_NOTE = ("<!-- 這台電腦的 PATH 上沒有 agora 指令，所以寫 Agora 的完整路徑；"
+               "執行 pip install -e <Agora 資料夾> 後重新 agora install，就會改成固定的 agora 指令。 -->")
+
+
+def agents_section(plan: dict) -> str:
+    """AGENTS.md 裡 Agora 管理的區段；寫完整路徑時在區段內註明原因"""
+    section = render_template(plan, "codex", "AGENTS.md").strip()
+    if plan["cmd"] != "agora":
+        section = section.replace("<!-- agora:begin -->", "<!-- agora:begin -->\n" + LEGACY_NOTE, 1)
+    return section
 
 
 def render_template(plan: dict, *parts: str) -> str:
@@ -1748,12 +1794,13 @@ def install_status(ws: Workspace) -> dict:
             for skill in ("agora", "relay"):
                 path = ws.root / rel / skill / "SKILL.md"
                 check(f"{NAMES[agent]} skill「{skill}」", path.exists(),
-                      path.exists() and path.read_text(encoding="utf-8") == render_template(plan, agent, skill, "SKILL.md"))
+                      path.exists() and _normalized(path.read_text(encoding="utf-8"))
+                      == _normalized(render_template(plan, agent, skill, "SKILL.md")))
     if "codex" in enabled:
         agents_md = ws.root / "AGENTS.md"
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-        section = render_template(plan, "codex", "AGENTS.md").strip()
-        check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, section in text)
+        section = agents_section(plan)
+        check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, _normalized(section) in _normalized(text))
     if "claude" in enabled:
         commands = _hook_commands(ws.root / ".claude" / "settings.local.json", lambda d: [
             h.get("command", "") for groups in (d.get("hooks") or {}).values() for g in groups for h in g.get("hooks", [])])
@@ -1794,12 +1841,15 @@ def cmd_install(ws: Workspace, args):
         if status["state"] != "installed":
             print("執行 agora install 安裝或更新。")
         return
+    guard_nested()   # 被 Agora 呼叫的 AI（接手方）不能改 hook 與說明檔
     plan = install_plan()
     root, hook, legacy, cmd = plan["root"], plan["hook"], plan["legacy"], plan["cmd"]
     done = []
+    changed: List[Path] = []   # 這次實際改寫的檔案
 
     config_file = config.config_path(ws.root)
     if not config_file.exists():
+        changed.append(config_file)
         config.save(ws.root, {"parties": {p: {"enabled": True} for p in AI_PARTIES}})
         done.append(f"預設設定 → {config_file}（用 agora parties 或 VSCode 擴充套件選擇參與的 AI）")
     enabled = ws.enabled()
@@ -1809,9 +1859,9 @@ def cmd_install(ws: Workspace, args):
             continue
         dest = ws.root / rel
         for skill in ("agora", "relay"):
-            target = dest / skill
-            target.mkdir(parents=True, exist_ok=True)
-            (target / "SKILL.md").write_text(render_template(plan, agent, skill, "SKILL.md"), encoding="utf-8")
+            path = dest / skill / "SKILL.md"
+            if write_if_changed(path, render_template(plan, agent, skill, "SKILL.md")):
+                changed.append(path)
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
@@ -1819,11 +1869,12 @@ def cmd_install(ws: Workspace, args):
     if "codex" in enabled:
         agents_md = ws.root / "AGENTS.md"
         created_agents_md = not agents_md.exists()
-        section = render_template(plan, "codex", "AGENTS.md").strip()
+        section = agents_section(plan)
         text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
         text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
             if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
-        agents_md.write_text(text.rstrip() + "\n", encoding="utf-8")
+        if write_if_changed(agents_md, text.rstrip() + "\n"):
+            changed.append(agents_md)
         done.append(f"Codex 說明 → {agents_md}")
 
     def claude_hooks(data):
@@ -1835,7 +1886,8 @@ def cmd_install(ws: Workspace, args):
                 group["matcher"] = matcher
             hooks[event] = groups + [group]
     if "claude" in enabled:
-        _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks)
+        if _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks):
+            changed.append(ws.root / ".claude" / "settings.local.json")
         done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
 
     def agy_hooks(data):
@@ -1860,9 +1912,11 @@ def cmd_install(ws: Workspace, args):
                 allow.append(rule)
     if "antigravity" in enabled:
         created_hooks = not (ws.root / ".agents" / "hooks.json").exists()
-        _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks)
+        if _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks):
+            changed.append(ws.root / ".agents" / "hooks.json")
         done.append("Antigravity hook（額度、子代理開關）→ .agents/hooks.json")
-        _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions)
+        if _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions):
+            changed.append(Path.home() / ".gemini" / "antigravity-cli" / "settings.json")
         done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
     # Agora 建立的檔案寫進 .git/info/exclude（不改會被 commit 的 .gitignore）；
@@ -1880,6 +1934,10 @@ def cmd_install(ws: Workspace, args):
     else:
         done.append(f"git 排除（{excluded}）：{'、'.join(owned)}")
 
+    shown = record_install(ws, changed)
+    # 第一行說明這次改了哪些檔案（VSCode 面板的通知只顯示第一行）
+    print(f"Agora {__version__} 更新了 {len(shown)} 個檔案：{'、'.join(shown)}" if shown
+          else f"Agora {__version__}：此專案的 Agora 檔案都是最新，沒有改動任何檔案。")
     print(f"已將 Agora 安裝到 {ws.root}（參與的 AI：{'、'.join(NAMES[p] for p in enabled)}）：")
     for d in done:
         print(f"  • {d}")
@@ -1912,6 +1970,73 @@ def check_advice(ws: Workspace) -> List[str]:
                 f"{command_label(suggested)}。要固定下來，可在 .agora/config.json 加入：")
     return [head, f"    {snippet}",
             "build 不會自動偵測；專案需要建置步驟時，另外設定 \"build\"（接手方只能透過 agora build 執行它）。"]
+
+
+INSTALL_LOG = Path(".agora") / "install.log"          # 工作區內、給人看的紀錄
+INSTALL_WRITES = quota.AGORA_HOME / "install_writes.jsonl"   # 接手方寫不到的位置：判斷哪些改動是 Agora 自己寫的
+
+
+def _display(ws: Workspace, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ws.root.resolve()).as_posix()
+    except ValueError:
+        try:
+            return "~/" + path.resolve().relative_to(Path.home().resolve()).as_posix()
+        except ValueError:
+            return str(path)
+
+
+def record_install(ws: Workspace, changed: List[Path]) -> List[str]:
+    """把這次 install 改寫的檔案記進 .agora/install.log；工作區內的檔案另記雜湊到 ~/.agora，
+    接手期間的越界檢查與 changes 據此辨認「Agora 自動更新」。回傳顯示用的路徑"""
+    shown = [_display(ws, p) for p in changed]
+    line = (f"{now_str()} · Agora {__version__}（{AGORA_ROOT_DIR.as_posix()}，指令 {install_plan()['cmd']}）"
+            + (f"更新了：{'、'.join(shown)}" if shown else "沒有改動任何檔案") + "\n")
+    try:
+        log = ws.root / INSTALL_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+    hashes = {}
+    for p, rel in zip(changed, shown):
+        if not rel.startswith(("~/", "/")) and ":" not in rel:
+            try:
+                hashes[rel] = file_hash(p)
+            except OSError:
+                pass
+    if hashes:
+        try:
+            INSTALL_WRITES.parent.mkdir(parents=True, exist_ok=True)
+            with open(INSTALL_WRITES, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": time.time(), "workspace": str(ws.root.resolve()), "version": __version__,
+                                    "files": hashes}, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+    return shown
+
+
+def agora_writes(root: Path, since: float) -> dict:
+    """since 之後 install 寫進這個工作區的檔案：{相對路徑: 雜湊}"""
+    out = {}
+    try:
+        lines = INSTALL_WRITES.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("workspace") == str(root.resolve()) and rec.get("ts", 0) >= since:
+            out.update(rec.get("files") or {})
+    return out
+
+
+def written_by_agora(root: Path, rel: str, writes: dict) -> bool:
+    """rel 目前的內容是 install 寫入的那一份"""
+    return rel in writes and file_hash(root / rel) == writes[rel]
 
 
 EXCLUDE_BEGIN, EXCLUDE_END = "# agora:begin（由 agora install 管理）", "# agora:end"

@@ -34,7 +34,19 @@ cd <專案資料夾> && agora install    # 安裝 skills、hook、權限與 git 
 
 - 用 `pip install -e` 安裝後，skills、接手方的指令權限與工作提示都改用固定的 `agora` 指令，Agora 搬家或更新時不必替每個專案重新 install（額度 hook 仍記錄路徑，搬家後要重新 install）。
 - 沒有安裝時照樣可以用 `python <Agora 資料夾>/agora.py`；Antigravity 的權限會同時保留兩種寫法，已裝過的 skills 不受影響。
-- 只有當 PATH 上的 `agora` 屬於目前這個 Python、而且指向這份程式時才會使用它，否則退回路徑寫法。
+- 寫進 skills 與 `AGENTS.md` 的指令：PATH 上有 `agora` 就固定寫 `agora`，不論這次是哪一份 Agora 執行 install；PATH 上沒有時才寫完整路徑，並在 `AGENTS.md` 的區段內註明原因。
+- 給接手方的工作提示與 Claude 的指令白名單，只有當 PATH 上的 `agora` 屬於目前這個 Python、而且指向這份程式時才用它，否則用路徑寫法（確保執行的是同一份程式）。
+
+### install 會改哪些檔案
+
+- 只有執行 install 時才會改寫工作區的檔案：終端機的 `agora install`、VSCode 面板的「安裝到此專案／更新」按鈕（Agora 升級後安裝狀態變成「舊版」，面板就會顯示「更新」），以及建立討論串時「此專案尚未安裝 Agora，要先安裝嗎？」選「安裝」。
+  擴充套件啟動時同步 `~/.agora/core`、額度 hook、討論與分派都不會改寫工作區的檔案；被 Agora 呼叫的 AI（接手方）不能執行 install。
+- 只改 Agora 管理的部分：skills（`.claude/skills/agora|relay`、`.agents/skills/agora|relay`）、`AGENTS.md` 的 `<!-- agora:begin -->` 區段、`.claude/settings.local.json` 與 `.agents/hooks.json` 裡 Agora 的 hook，以及全域的 `~/.gemini/antigravity-cli/settings.json` 權限。
+- 內容沒有實質變化（只差換行字元或行尾空白）時不寫入；寫入時沿用檔案原本的換行字元，不會只因換行而產生 git 改動。
+- install 輸出的第一行列出這次實際改寫的檔案（VSCode 的通知顯示的也是這一行），同時記進 `.agora/install.log`（時間、Agora 版本與位置、改了哪些檔案）。
+- 額度 hook 記的是**執行 install 的那份 Agora** 的路徑（擴充套件內建的 `~/.agora/core`，或 `pip install -e` 的資料夾）。從不同地方執行 install 會改寫 hook 路徑，建議固定用同一種方式。
+- 接手期間若有人執行 install，被改寫的 hook 在越界檢查中標成「Agora 自動更新」並保留，`changes` 也會標示，不算接手方的改動；接手方自己改的照樣還原。
+  辨認依據是 install 記在 `~/.agora/install_writes.jsonl` 的內容雜湊，接手方寫不到這個位置。
 
 ## 指令
 

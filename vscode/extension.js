@@ -698,7 +698,7 @@ function activate(context) {
 
   command("agora.install", async () => {
     const out = await runAgora(["install"]);
-    vscode.window.showInformationMessage(out.trim().split("\n")[0]);
+    vscode.window.showInformationMessage(out.trim().split("\n")[0]);   // 第一行：這次改了哪些檔案（完整輸出在 Agora 輸出面板）
     refreshAll();
   });
 
