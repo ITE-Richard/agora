@@ -56,9 +56,9 @@ $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（�
 $A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則依分配比例挑選）
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
 $A assign <id> --from human --from-summary [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
-$A status <id> [--wait 900]                         # 分派狀態與最新進度
+$A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
-$A recall <id>                                      # 請接手方在下一個檢查點暫停
+$A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
 $A quota [--refresh] [--json]                       # 三方剩餘額度
@@ -72,6 +72,27 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 ```
 
 `<id>` 可以用前綴或 `latest`。沒給 `--message` / `--file` 時讀 stdin。
+
+## 等待分派結果
+
+`status <id> --wait N` 等到接手結束或超過 N 秒。加 `--wait` 時以 exit code 區分結果，腳本不必再解析 `state.json`：
+
+| exit code | 意思 |
+|---|---|
+| 0 | 已結束，而且完成（`done`） |
+| 1 | 已結束，但沒有完成（`failed`、`blocked`、`interrupted`、`stopped`、`max_rounds`），或沒有分派紀錄 |
+| 2 | 等待逾時，接手方仍在進行；輸出第一行是「⏳ 等待 N 秒逾時，接手方仍在進行（狀態：running）」 |
+
+沒加 `--wait` 時只報告狀態，exit code 一律是 0。`--json` 輸出
+`{status, worker, alive, rounds, timed_out, waiting_until, updated, started, error, denied, denied_summary, warning, last_progress, exit_code}`。
+
+- 剛 `assign` 的工作在背景程序記下 PID 前（狀態 `starting` 未滿 60 秒）一律視為進行中，`status`、`activity` 與其他同時執行的指令不會把它判成中斷。
+  assign 必須先寫入狀態再啟動背景程序（背景程序一啟動就讀取它），所以用這段緩衝，而不是先啟動再寫入。
+- `recall` 依當時狀態說明多久會停：等待額度時約 1 分鐘內（每分鐘檢查一次）；正在執行某一輪時，要等這一輪結束（會顯示第幾輪、已執行多久）。
+  `recall --wait [秒數]` 等到真的停止：停止或完成時 exit code 0，以其他狀態結束為 1，逾時為 2。
+- 不提供強制中止（`--now`）：每一輪結束時，Agora 會還原接手方改動的 hook、自動執行的設定與 `.agora/config.json`（見[權限與安全](#權限與安全)）。
+  中途終止會跳過這一步，等於讓接手方繞過指令白名單；被中斷的 CLI 對話狀態也無法預期。
+  真的必須立刻停止時，從工作管理員結束接手程序，再用 `agora changes <id>` 與 `git status` 檢查工作區，並手動確認 `.claude/`、`.agents/`、`.codex/`、git hooks 沒有被改動。
 
 ## 總結與依總結分派
 

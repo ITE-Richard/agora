@@ -1168,6 +1168,122 @@ else:
         self.assertEqual(data["leaf"]["hwnd"], 0, "子程序的主控台不應有視窗")
 
 
+class TestRelayStatus(unittest.TestCase):
+    def make(self, tmp, **relay):
+        ws = cli.Workspace(Path(tmp))
+        thread = ws.threads / "t1"
+        thread.mkdir(parents=True)
+        state = state_with(["claude", "codex"])
+        state["relay"] = {"worker": "codex", "from": "claude", "handoff": "做事", "rounds": 0, **relay}
+        cli.save_state(thread, state)
+        (thread / "transcript.md").write_text("", encoding="utf-8")
+        (thread / "progress.md").write_text("# 工作進度：t\n\n## 10:00 · Codex\n\n寫好第一步\n", encoding="utf-8")
+        return ws, thread
+
+    def status(self, ws, wait=None, as_json=False):
+        out = io.StringIO()
+        with patch("sys.stdout", out), patch("time.sleep"):
+            try:
+                cli.cmd_status(ws, argparse.Namespace(thread="t1", wait=wait, json=as_json))
+                code = None
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_fresh_starting_relay_is_not_interrupted(self):
+        """剛 assign、還沒記下 PID 的 relay：未滿 60 秒不能被 activity 判成 interrupted，超過才改"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.make(tmp, status="starting", started_ts=time.time())
+            items = cli.activity(ws)
+            self.assertEqual([(i["type"], i["status"]) for i in items], [("relay", "starting")])
+            self.assertEqual(cli.load_state(thread)["relay"]["status"], "starting")
+            self.assertTrue(cli.state_relay_active(thread))
+
+            cli.update_relay(thread, started_ts=time.time() - 61)
+            self.assertEqual(cli.activity(ws), [])
+            self.assertEqual(cli.load_state(thread)["relay"]["status"], "interrupted")
+
+    def test_old_relay_without_started_ts_uses_started(self):
+        relay = {"status": "starting", "started": cli.now_str()}
+        self.assertTrue(cli.relay_alive(relay))
+        relay["started"] = "2020-01-01 00:00:00"
+        self.assertFalse(cli.relay_alive(relay))
+
+    def test_status_exit_codes_and_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.make(tmp, status="done", rounds=3)
+            self.assertEqual(self.status(ws)[0], None)              # 沒有 --wait：只報告，不設 exit code
+            self.assertEqual(self.status(ws, wait=5)[0], 0)
+
+            cli.update_relay(thread, status="failed", error="Codex 未產生回覆")
+            code, out = self.status(ws, wait=5)
+            self.assertEqual(code, 1)
+            self.assertIn("原因：Codex 未產生回覆", out)
+
+            cli.update_relay(thread, status="running", pid=os.getpid(), pid_started=jobs.pid_started(os.getpid()),
+                             waiting_until=None)
+            code, out = self.status(ws, wait=1)
+            self.assertEqual(code, 2)
+            self.assertTrue(out.startswith("⏳ 等待 1 秒逾時，接手方仍在進行（狀態：running）"))
+
+            code, out = self.status(ws, wait=1, as_json=True)
+            data = json.loads(out)
+            self.assertEqual(code, 2)
+            self.assertEqual({k: data[k] for k in ("status", "alive", "rounds", "timed_out", "waiting_until", "exit_code")},
+                             {"status": "running", "alive": True, "rounds": 3, "timed_out": True,
+                              "waiting_until": None, "exit_code": 2})
+            self.assertIn("寫好第一步", data["last_progress"])
+            self.assertTrue(data["updated"])
+
+            # 背景程序已不在：改記 interrupted，屬於「已結束但未完成」
+            cli.update_relay(thread, pid=99999999, pid_started=None)
+            code, out = self.status(ws, wait=5)
+            self.assertEqual(code, 1)
+            self.assertEqual(cli.load_state(thread)["relay"]["status"], "interrupted")
+
+    def recall(self, ws, wait=None, on_sleep=None):
+        out = io.StringIO()
+        with patch("sys.stdout", out), patch("time.sleep", on_sleep or (lambda s: None)):
+            try:
+                cli.cmd_recall(ws, argparse.Namespace(thread="t1", wait=wait))
+                code = None
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_recall_message_depends_on_state(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
+            os.environ.pop(parties.NESTED_ENV, None)
+            alive = {"pid": os.getpid(), "pid_started": jobs.pid_started(os.getpid())}
+            ws, thread = self.make(tmp, status="waiting", **alive)
+            code, out = self.recall(ws)
+            self.assertIsNone(code)
+            self.assertIn("在等待額度，約 1 分鐘內停止", out)
+            self.assertTrue(cli.stop_requested(thread))
+
+            cli.update_relay(thread, status="running", rounds=2, round_started=time.time() - 600)
+            code, out = self.recall(ws)
+            self.assertIn("正在執行第 3 輪（已執行 10 分鐘），會在這一輪結束後停止", out)
+
+            cli.update_relay(thread, status="done")
+            code, out = self.recall(ws)
+            self.assertIn("不需要收回", out)
+
+    def test_recall_wait(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
+            os.environ.pop(parties.NESTED_ENV, None)
+            ws, thread = self.make(tmp, status="running", pid=os.getpid(), pid_started=jobs.pid_started(os.getpid()))
+            # 接手方在等待期間停下
+            code, out = self.recall(ws, wait=600, on_sleep=lambda s: cli.update_relay(thread, status="stopped"))
+            self.assertEqual(code, 0)
+            self.assertIn("接手方已停止（狀態：stopped）", out)
+
+            cli.update_relay(thread, status="running")
+            code, out = self.recall(ws, wait=1)
+            self.assertEqual(code, 2)
+            self.assertIn("⏳ 等待 1 秒逾時，接手方仍在進行（狀態：running）", out)
+
+
 class TestCliResolvers(unittest.TestCase):
     def test_find_codex_env_override(self):
         with patch.dict(os.environ, {"CODEX_PATH": "/custom/codex"}):
@@ -1239,12 +1355,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.8")
+        self.assertEqual(__version__, "0.2.9")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.8", out.getvalue())
+        self.assertIn("0.2.9", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

@@ -451,8 +451,7 @@ def in_background(ws: Workspace, thread: Path, kind: str, argv: List[str], text:
 
 
 def state_relay_active(thread: Path) -> bool:
-    relay = load_state(thread).get("relay") or {}
-    return relay.get("status") in ("starting", "running", "waiting") and jobs.alive(relay)
+    return relay_alive(load_state(thread).get("relay") or {})
 
 
 def cmd_send(ws: Workspace, args):
@@ -684,6 +683,37 @@ def update_relay(thread: Path, **fields) -> dict:
         return state["relay"]
 
 
+RELAY_ACTIVE = ("starting", "running", "waiting")
+START_GRACE = 60   # 剛分派、背景程序還沒記下 PID 的空檔（同 jobs.active 對討論工作的處理）
+
+
+def relay_started_ts(relay: dict) -> float:
+    if relay.get("started_ts"):
+        return relay["started_ts"]
+    try:
+        return datetime.strptime(relay.get("started") or "", "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return 0.0
+
+
+def relay_alive(relay: dict) -> bool:
+    """分派的背景程序是否仍在進行。assign 先寫入 starting、啟動背景程序後才記下 PID，
+    這段空檔（starting 未滿 START_GRACE 秒）一律視為進行中，避免同時執行的其他指令把它判成 interrupted"""
+    if relay.get("status") not in RELAY_ACTIVE:
+        return False
+    if relay["status"] == "starting" and time.time() - relay_started_ts(relay) < START_GRACE:
+        return True
+    return jobs.alive(relay)
+
+
+def current_relay(thread: Path) -> Optional[dict]:
+    """分派紀錄；狀態仍是進行中、背景程序卻已不在（被強制終止）的改記為 interrupted"""
+    relay = load_state(thread).get("relay")
+    if relay and relay.get("status") in RELAY_ACTIVE and not relay_alive(relay):
+        relay = update_relay(thread, status="interrupted")
+    return relay
+
+
 def stop_requested(thread: Path) -> bool:
     try:
         return bool(json.loads(relay_paths(thread)["control"].read_text(encoding="utf-8")).get("stop_requested"))
@@ -725,7 +755,7 @@ def cmd_assign(ws: Workspace, args):
         text = read_message(args)
     worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
     old = state.get("relay") or {}
-    if old.get("status") in ("starting", "running", "waiting") and jobs.alive(old):
+    if relay_alive(old):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
 
     paths = relay_paths(thread)
@@ -747,13 +777,18 @@ def cmd_assign(ws: Workspace, args):
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           "session_id": args.session, "external_session": args.session,
-                          "handoff": text.strip(), "started": now_str(),
+                          "handoff": text.strip(), "started": now_str(), "started_ts": time.time(),
                           "updated": now_str(), "baseline": baseline}
         save_state(thread, state)
 
+    # 背景程序一啟動就讀 state.json 的 relay，所以先寫入 starting 再啟動；記下 PID 前的空檔由 relay_alive 的緩衝涵蓋
     entry = AGORA_ROOT_DIR / "agora.py"
-    pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
-                     ws.root, paths["log"], paths["log"], append=True)
+    try:
+        pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
+                         ws.root, paths["log"], paths["log"], append=True)
+    except Exception as e:
+        update_relay(thread, status="failed", error=f"無法啟動背景程序：{e}")
+        sys.exit(f"無法啟動接手程序：{e}")
     update_relay(thread, pid=pid, pid_started=jobs.pid_started(pid))
     print(f"已分派給 {NAMES[worker]}（背景程序 PID {pid}，關閉視窗也會繼續）。")
     if baseline.get("error"):
@@ -1016,7 +1051,7 @@ def cmd_work(ws: Workspace, args):
             quota.refresh(force=True)
             continue
 
-        relay = update_relay(thread, status="running", waiting_until=None)
+        relay = update_relay(thread, status="running", waiting_until=None, round_started=time.time())
         fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root,
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
                    agora=agora_cmd())
@@ -1110,38 +1145,96 @@ def cmd_work(ws: Workspace, args):
     add_system_note(thread, f"⚠️ {NAMES[worker]} 已達最大輪數 {MAX_WORK_ROUNDS}，接手程序結束。")
 
 
+def wait_relay(thread: Path, seconds: Optional[int]):
+    """等到接手結束或超過 seconds 秒，回傳 (relay, 是否仍在進行, 是否等待逾時)；starting 緩衝期間視為進行中"""
+    deadline = time.time() + (seconds or 0)
+    while True:
+        relay = current_relay(thread)
+        alive = bool(relay) and relay_alive(relay)
+        if not alive or time.time() >= deadline:
+            return relay, alive, bool(seconds) and alive
+        time.sleep(max(1, min(15, deadline - time.time())))
+
+
+def relay_exit_code(relay: Optional[dict], alive: bool) -> int:
+    """0＝已結束且完成（done）；1＝已結束但失敗、中斷、停止等；2＝仍在進行（等待逾時）"""
+    if alive:
+        return 2
+    return 0 if relay and relay.get("status") == "done" else 1
+
+
+def progress_blocks(thread: Path) -> List[str]:
+    progress = relay_paths(thread)["progress"]
+    if not progress.exists():
+        return []
+    return re.split(r"\n(?=## )", progress.read_text(encoding="utf-8"))[1:]   # 第一段是標題
+
+
 def cmd_status(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
-    deadline = time.time() + (args.wait or 0)
-    while True:
-        relay = load_state(thread).get("relay")
-        if not relay:
-            print("此討論串沒有分派紀錄。")
-            return
-        alive = jobs.alive(relay)
-        if not (alive and relay["status"] in ("starting", "running", "waiting")) or time.time() >= deadline:
-            break
-        time.sleep(15)
-    waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
-    print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
-          f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
-    if denial_summary(relay):
-        print(f"⚠️ {denial_summary(relay)}")
-    if unverified_warning(relay):
-        print(f"⚠️ {unverified_warning(relay)}")
-    progress = relay_paths(thread)["progress"]
-    if progress.exists():
-        blocks = re.split(r"\n(?=## )", progress.read_text(encoding="utf-8"))
-        print("\n最新進度：\n" + "\n".join(blocks[-2:]))
+    relay, alive, timed_out = wait_relay(thread, args.wait)
+    if not relay:
+        print(json.dumps({"status": None}) if args.json else "此討論串沒有分派紀錄。")
+        if args.wait:
+            sys.exit(1)
+        return
+    blocks = progress_blocks(thread)
+    code = relay_exit_code(relay, alive)
+    if args.json:
+        print(json.dumps({"status": relay.get("status"), "worker": relay.get("worker"), "alive": alive,
+                          "rounds": relay.get("rounds", 0), "timed_out": timed_out,
+                          "waiting_until": relay.get("waiting_until"), "updated": relay.get("updated"),
+                          "started": relay.get("started"), "error": relay.get("error"),
+                          "denied": relay.get("denied") or [], "denied_summary": denial_summary(relay),
+                          "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
+                          "exit_code": code}, ensure_ascii=False, indent=2))
+    else:
+        if timed_out:
+            print(f"⏳ 等待 {args.wait} 秒逾時，接手方仍在進行（狀態：{relay['status']}）")
+        waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
+        print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
+              f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
+        if relay.get("error") and not alive:
+            print(f"原因：{relay['error']}")
+        for line in (denial_summary(relay), unverified_warning(relay)):
+            if line:
+                print(f"⚠️ {line}")
+        if blocks:
+            print("\n最新進度：\n" + "\n".join(blocks[-2:]))
+    if args.wait:
+        sys.exit(code)
+
+
+def recall_eta(relay: dict) -> str:
+    """接手方大約何時會停下：等額度時每分鐘檢查一次；執行中要等這一輪結束"""
+    if relay["status"] == "waiting":
+        return "在等待額度，約 1 分鐘內停止"
+    if relay["status"] == "running":
+        minutes = int((time.time() - (relay.get("round_started") or relay_started_ts(relay))) / 60)
+        return f"正在執行第 {relay.get('rounds', 0) + 1} 輪（已執行 {minutes} 分鐘），會在這一輪結束後停止"
+    return "正在啟動，會在開始第一輪前停止"
 
 
 def cmd_recall(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
+    relay = current_relay(thread)
+    if not relay or not relay_alive(relay):
+        print("目前沒有進行中的接手" + (f"（狀態：{relay['status']}）" if relay else "") + "，不需要收回。")
+        return
     relay_paths(thread)["control"].write_text(json.dumps({"stop_requested": True, "at": now_str()}), encoding="utf-8")
-    relay = load_state(thread).get("relay") or {}
-    add_system_note(thread, f"🔁 已要求 {NAMES.get(relay.get('worker'), '接手方')} 在下一個檢查點暫停。")
-    print("已要求接手方在下一個檢查點暫停。用 status --wait 600 等它停下。")
+    eta = f"{NAMES[relay['worker']]} {recall_eta(relay)}"
+    add_system_note(thread, f"🔁 已要求停止接手：{eta}。")
+    print(f"已要求停止接手：{eta}。")
+    if args.wait is None:
+        print(f"用 {agora_cmd()} recall {thread.name} --wait 或 status {thread.name} --wait 600 等它停下。")
+        return
+    relay, alive, timed_out = wait_relay(thread, args.wait)
+    if timed_out:
+        print(f"⏳ 等待 {args.wait} 秒逾時，接手方仍在進行（狀態：{relay['status']}）")
+        sys.exit(2)
+    print(f"接手方已停止（狀態：{relay['status']}）。")
+    sys.exit(0 if relay["status"] in ("stopped", "done") else 1)
 
 
 # ───────────────────────── 其他 ─────────────────────────
@@ -1356,8 +1449,8 @@ def activity(ws: Workspace) -> List[dict]:
                           "current": job.get("current"), "since": job.get("since"), "started": job.get("started"),
                           "pid": job.get("pid"), "live": str(live) if live.exists() else None})
         relay = state.get("relay") or {}
-        if relay.get("status") in ("starting", "running", "waiting"):
-            if jobs.alive(relay):
+        if relay.get("status") in RELAY_ACTIVE:
+            if relay_alive(relay):
                 live = live_path(thread, "work")
                 items.append({"thread": thread.name, "topic": state["topic"], "type": "relay",
                               "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),
@@ -1771,7 +1864,8 @@ def main(argv=None):
     for name in ("status", "relay-status"):
         p = sub.add_parser(name, help="查看分派狀態與最新進度")
         p.add_argument("thread")
-        p.add_argument("--wait", type=int, help="最多等待幾秒，直到接手程序結束")
+        p.add_argument("--wait", type=int, help="最多等待幾秒，直到接手程序結束（exit code：0 完成、1 失敗或中止、2 逾時仍在進行）")
+        p.add_argument("--json", action="store_true")
         p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("changes", help="分派期間的變更（相對於分派當下的工作區快照）")
@@ -1781,6 +1875,8 @@ def main(argv=None):
 
     p = sub.add_parser("recall", help="請接手方在下一個檢查點暫停")
     p.add_argument("thread")
+    p.add_argument("--wait", type=int, nargs="?", const=600, metavar="秒數",
+                   help="等到接手方真的停止（預設最多 600 秒；逾時 exit code 2）")
     p.set_defaults(func=cmd_recall)
 
     p = sub.add_parser("build", help="專案建置（執行 .agora/config.json 的 build 指令）")
