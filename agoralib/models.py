@@ -29,7 +29,7 @@ CLAUDE_ALIASES = [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("
 
 def _run(cmd: list, timeout: int = 60) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, stdin=subprocess.DEVNULL).stdout
+                          timeout=timeout, stdin=subprocess.DEVNULL, **quota.NO_WINDOW).stdout
 
 
 def claude_catalog() -> dict:

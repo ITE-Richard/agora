@@ -104,7 +104,8 @@ def scan(threads: List[Path], days: Optional[float]) -> Tuple[List[dict], List[d
 
 def delete_codex(session_id: str) -> str:
     proc = subprocess.run([quota.find_codex(), "delete", "--force", session_id], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=60, stdin=subprocess.DEVNULL)
+                          encoding="utf-8", errors="replace", timeout=60, stdin=subprocess.DEVNULL,
+                          **quota.NO_WINDOW)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout).strip()[-300:] or f"exit {proc.returncode}")
     return "codex delete"

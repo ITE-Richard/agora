@@ -68,7 +68,7 @@ class AgoraError extends Error {}
 
 function killTree(proc) {
   if (process.platform === "win32") {
-    cp.spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"]);
+    cp.spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
   } else {
     proc.kill();
   }

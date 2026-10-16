@@ -1099,6 +1099,74 @@ class TestJobs(unittest.TestCase):
             finally:
                 jobs.kill_tree(pid)
 
+    CONSOLE_PROBE = """
+import ctypes, json, os, subprocess, sys
+k = ctypes.windll.kernel32
+
+def info():
+    pids = (ctypes.c_uint32 * 64)()
+    n = k.GetConsoleProcessList(pids, 64)
+    return {"pid": os.getpid(), "cp": k.GetConsoleCP(), "hwnd": k.GetConsoleWindow(), "procs": list(pids[:min(n, 64)])}
+
+if sys.argv[1] == "leaf":
+    print(json.dumps(info()))
+else:
+    sys.path.insert(0, sys.argv[3])
+    from agoralib import quota
+    kw = quota.NO_WINDOW if sys.argv[1] == "no_window" else {}
+    leaf = subprocess.run([sys.executable, __file__, "leaf"], capture_output=True, text=True, **kw).stdout
+    with open(sys.argv[2] + ".tmp", "w") as f:
+        json.dump({"parent": info(), "leaf": json.loads(leaf), "no_window": quota.NO_WINDOW}, f)
+    os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+"""
+
+    def _console_probe(self, launch) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            script, result = Path(tmp) / "probe.py", Path(tmp) / "result.json"
+            script.write_text(self.CONSOLE_PROBE, encoding="utf-8")
+            pid = launch(script, result, tmp)
+            try:
+                for _ in range(200):
+                    if result.exists():
+                        return json.loads(result.read_text(encoding="utf-8"))
+                    time.sleep(0.1)
+                self.fail("探測程序沒有寫出結果")
+            finally:
+                for _ in range(100):   # 等背景程序結束、放開輸出檔，暫存資料夾才刪得掉
+                    if not (pid and jobs.pid_alive(pid)):
+                        break
+                    time.sleep(0.1)
+
+    def test_background_children_share_hidden_console(self):
+        """背景程序呼叫的主控台程式要沿用它的隱藏主控台；DETACHED_PROCESS 時會各開一個新視窗（Windows Terminal 的新分頁）"""
+        if not sys.platform.startswith("win"):
+            self.skipTest("Windows 專用")
+        root = str(Path(__file__).resolve().parents[1])
+        data = self._console_probe(lambda script, result, tmp: jobs.spawn(
+            [sys.executable, str(script), "plain", str(result), root], Path(tmp), Path(tmp) / "out.txt", Path(tmp) / "out.txt"))
+        parent, leaf = data["parent"], data["leaf"]
+        self.assertTrue(parent["cp"], "背景程序應有主控台（隱藏的）")
+        self.assertEqual(parent["hwnd"], 0, "背景程序的主控台不應有視窗")
+        self.assertEqual(data["no_window"], {}, "已有主控台時不需另加 CREATE_NO_WINDOW")
+        self.assertIn(parent["pid"], leaf["procs"], "子程序應沿用背景程序的主控台，而不是另開一個")
+        self.assertEqual(leaf["hwnd"], 0)
+
+    def test_no_window_when_parent_has_no_console(self):
+        """父程序沒有主控台時（例如被 DETACHED_PROCESS 啟動），帶 NO_WINDOW 的子程序拿到隱藏主控台、不開視窗"""
+        if not sys.platform.startswith("win"):
+            self.skipTest("Windows 專用")
+        root = str(Path(__file__).resolve().parents[1])
+
+        def launch(script, result, tmp):   # 等它跑完，不需要回傳 PID
+            subprocess.run([sys.executable, str(script), "no_window", str(result), root],
+                           creationflags=0x00000008,   # DETACHED_PROCESS
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        data = self._console_probe(launch)
+        self.assertEqual(data["parent"]["cp"], 0, "DETACHED 的父程序沒有主控台")
+        self.assertEqual(data["no_window"], {"creationflags": subprocess.CREATE_NO_WINDOW})
+        self.assertTrue(data["leaf"]["cp"], "子程序應有自己的主控台")
+        self.assertEqual(data["leaf"]["hwnd"], 0, "子程序的主控台不應有視窗")
+
 
 class TestCliResolvers(unittest.TestCase):
     def test_find_codex_env_override(self):
@@ -1171,12 +1239,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.6")
+        self.assertEqual(__version__, "0.2.7")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.6", out.getvalue())
+        self.assertIn("0.2.7", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

@@ -122,7 +122,7 @@ def resolve_workspace(arg: Optional[str]) -> Path:
         return Path(os.environ["AGORA_WORKSPACE"]).resolve()
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
-                             encoding="utf-8", timeout=10).stdout.strip()
+                             encoding="utf-8", timeout=10, **quota.NO_WINDOW).stdout.strip()
         if top:
             return Path(top).resolve()
     except Exception:
@@ -206,7 +206,7 @@ def thread_lock(thread: Path, wait: int = 30):
 def git_status(root: Path) -> str:
     try:
         return subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True,
-                              encoding="utf-8", timeout=30).stdout
+                              encoding="utf-8", timeout=30, **quota.NO_WINDOW).stdout
     except Exception:
         return ""
 
@@ -864,7 +864,7 @@ PROTECTED_FILES = (".claude/settings.json", ".claude/settings.local.json", ".age
 def git_hooks_dir(root: Path) -> Optional[Path]:
     try:
         out = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=root, capture_output=True, text=True,
-                             encoding="utf-8", timeout=30)
+                             encoding="utf-8", timeout=30, **quota.NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode or not out.stdout.strip():
@@ -1065,7 +1065,7 @@ AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 
 def run_configured_command(spec, cwd: Path) -> subprocess.CompletedProcess:
     """執行 .agora/config.json 設定的指令：字串交給 shell；字串清單直接執行（不經 shell，
     Windows 上先找出 .exe/.cmd 的完整路徑）；清單的清單依序執行，遇到失敗就停"""
-    kw = dict(cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    kw = dict(cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", **quota.NO_WINDOW)
     if isinstance(spec, str):
         return subprocess.run(spec, shell=True, **kw)
     if isinstance(spec, list) and spec and all(isinstance(x, list) for x in spec):
@@ -1122,9 +1122,9 @@ def cmd_check(ws: Workspace, args):
     """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
     （沒設定時，有 tests/ 才跑 unittest）。建置另用 agora build"""
     files = subprocess.run(["git", "ls-files", "*.py"], cwd=ws.root, capture_output=True, text=True,
-                           encoding="utf-8").stdout.split()
+                           encoding="utf-8", **quota.NO_WINDOW).stdout.split()
     files += subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "*.py"], cwd=ws.root,
-                            capture_output=True, text=True, encoding="utf-8").stdout.split()
+                            capture_output=True, text=True, encoding="utf-8", **quota.NO_WINDOW).stdout.split()
     errors = []
     for f in files:   # 只檢查語法、不寫 __pycache__（唯讀沙箱裡也能執行）
         try:
@@ -1587,7 +1587,8 @@ def git_exclude(root: Path, paths: List[str]):
     """把 paths（相對於工作區）加進 git 的 info/exclude 的 Agora 區段，保留區段內之前加過的項目。
     回傳 (exclude 檔路徑或 None（不是 git repo）, 已被 git 追蹤的路徑)"""
     def git(*args):
-        proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=30,
+                              **quota.NO_WINDOW)
         return proc.stdout.strip() if proc.returncode == 0 else None
     try:
         if git("rev-parse", "--is-inside-work-tree") != "true":

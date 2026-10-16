@@ -198,7 +198,8 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
     env.pop(LOCKED_ENV, None)    # 只有接手工作時由呼叫端明確帶入
     env.update({NESTED_ENV: "1", **(extra_env or {})})
     proc = subprocess.Popen(cmd, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
+                            **quota.NO_WINDOW)
     errors: list = []
 
     def feed():
@@ -213,7 +214,7 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
     def kill():
         expired.set()
         if sys.platform.startswith("win"):
-            subprocess.run(["taskkill", "/pid", str(proc.pid), "/T", "/F"], capture_output=True)
+            subprocess.run(["taskkill", "/pid", str(proc.pid), "/T", "/F"], capture_output=True, **quota.NO_WINDOW)
         else:
             proc.kill()
 

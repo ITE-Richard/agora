@@ -15,6 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from agoralib.quota import NO_WINDOW
+
 REF_PREFIX = "refs/agora/"
 SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", ".agora/**")
 IDENTITY = {"GIT_AUTHOR_NAME": "Agora", "GIT_AUTHOR_EMAIL": "agora@localhost",
@@ -28,7 +30,7 @@ class SnapshotError(RuntimeError):
 
 def _run(root: Path, args, env: Optional[dict]) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=300, env={**os.environ, **(env or {})})
+                          errors="replace", timeout=300, env={**os.environ, **(env or {})}, **NO_WINDOW)
 
 
 def _git(root: Path, *args: str, env: Optional[dict] = None, check: bool = True) -> str:

@@ -79,8 +79,9 @@ def pid_alive(pid: Optional[int], started: Optional[float] = None) -> bool:
         try:
             exists, created = _win_process(pid)
         except (OSError, AttributeError):
+            from agoralib.quota import NO_WINDOW   # 以腳本執行 launch 時用不到，不在開頭匯入
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace").stdout
+                                 encoding="utf-8", errors="replace", **NO_WINDOW).stdout
             exists, created = str(pid) in out.split(), None
     else:
         try:
@@ -101,7 +102,8 @@ def alive(record: dict) -> bool:
 
 def kill_tree(pid: int):
     if sys.platform.startswith("win"):
-        subprocess.run(["taskkill", "/pid", str(pid), "/T", "/F"], capture_output=True)
+        from agoralib.quota import NO_WINDOW
+        subprocess.run(["taskkill", "/pid", str(pid), "/T", "/F"], capture_output=True, **NO_WINDOW)
     else:
         try:
             os.killpg(pid, 15)

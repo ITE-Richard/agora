@@ -45,6 +45,24 @@ THRESHOLD_PCT = float(os.getenv("AGORA_QUOTA_THRESHOLD", "5"))
 AGY_POOL = os.getenv("AGORA_AGY_POOL", "gemini")
 PROBE_ENV = "AGORA_PROBE"
 
+
+def _no_window() -> dict:
+    """Windows：目前程序沒有主控台時（GetConsoleCP 為 0，例如被 DETACHED_PROCESS 或 GUI 程式啟動），
+    主控台子程序會各開一個新視窗（Windows Terminal 會多出一個分頁），所以加 CREATE_NO_WINDOW 給它隱藏主控台；
+    有主控台（含隱藏主控台）時子程序直接沿用，在終端機裡執行的行為（例如 Ctrl+C）不變"""
+    if not sys.platform.startswith("win"):
+        return {}
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleCP():
+            return {}
+    except (OSError, AttributeError):
+        pass
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
+
+NO_WINDOW = _no_window()   # 每個 subprocess 呼叫都帶上：subprocess.run(..., **quota.NO_WINDOW)
+
 try:
     AGORA_HOME.mkdir(exist_ok=True)
 except OSError:  # 沙箱內的接手方可能無權建立
@@ -105,7 +123,7 @@ def probe_claude(timeout: int = 90) -> bool:
            "--tools", "", "--no-session-persistence", "--settings", '{"disableAllHooks": true}']
     try:
         proc = subprocess.run(cmd, cwd=AGORA_HOME, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, env={**os.environ, PROBE_ENV: "1"})
+                              errors="replace", timeout=timeout, env={**os.environ, PROBE_ENV: "1"}, **NO_WINDOW)
     except Exception:
         return False
     for line in proc.stdout.splitlines():
@@ -279,7 +297,8 @@ def _list_processes() -> list[dict]:
     cmd = f'Get-CimInstance Win32_Process -Filter "{names}" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress'
     try:
         out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout.strip()
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                             **NO_WINDOW).stdout.strip()
         data = json.loads(out) if out else []
     except Exception:
         return []
