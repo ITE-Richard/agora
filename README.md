@@ -230,11 +230,28 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 - `summarizer`：`summarize` 沒給 `--by` 時的總結方，例如 `"claude"`。
 - `build`：`agora build` 執行的建置指令，例如 `"west build"`。有設定時，接手方完成工作前也會執行。
-- `check`：`agora check` 在語法檢查後執行的驗證指令，例如 `["python", "-m", "unittest", "discover", "-s", "tests"]`；沒設定時，有 `tests/` 資料夾才跑 unittest。`check` 不包含建置。
+- `check`：`agora check` 在語法檢查後執行的驗證指令，例如 `[".venv\\Scripts\\python.exe", "-m", "pytest", "-q"]`；沒設定時自動偵測（見[接手方的驗證環境](#接手方的驗證環境)）。`check` 不包含建置。
 - `add_dirs`：Codex 接手工作（workspace-write）時額外可寫的目錄，相對路徑以工作區為準，不存在的略過。
 
 `build`、`check` 寫成字串時交給 shell 執行；寫成字串清單時直接執行、不經 shell；寫成清單的清單時依序執行，遇到失敗就停。
 參與的 AI、模型與 Codex 的沙箱模式可用 `agora parties` 或 VSCode 面板調整。
+
+### 接手方的驗證環境
+
+接手方受指令白名單限制，只能執行不帶參數的 `agora check` 與 `agora build`，不能自己改跑 `.venv\Scripts\python -m pytest`。
+所以測試在哪個 Python、用什麼工具跑，完全由 `.agora/config.json` 的 `check`／`build` 決定；接手當輪用的是該輪開始時的設定，接手方改了也不會生效。
+
+沒有設定 `check` 時，`agora check` 自動偵測：
+
+1. Python：工作區有 `.venv` 或 `venv`（Windows 為 `Scripts\python.exe`，其他平台為 `bin/python`）就用它，否則用 Agora 自己的 Python。
+2. 測試工具：專案有 pytest 設定（`pyproject.toml` 的 `[tool.pytest…]`、`pytest.ini`、`conftest.py`、`setup.cfg`、`tox.ini`）、而且上面那個 Python 裝了 pytest，就執行 `python -m pytest -q`；否則有 `tests/` 才執行 `python -m unittest discover -s tests`。
+
+`agora check` 輸出的第一行是實際執行的指令、Python 路徑與來源（設定檔、分派當輪的設定或自動偵測），環境不對時一眼就看得出來。
+
+- 偵測不到正確環境時（例如虛擬環境在別處、要用 tox 或 nox），請明確設定 `check`。
+- `install` 偵測到 `.venv`／`venv` 但沒有設定 `check`，或 `check` 用的是舊版 install 寫入的 Agora 自己的 Python 時，會印出建議的設定。新的 install 不再把 `check` 寫進設定檔。
+- `build` 不會自動偵測；專案需要建置（例如產生檔案、編譯韌體）時請設定 `build`，接手方完成工作前會執行它。
+- `check` 會執行專案的測試程式碼，接手方改了測試就等於改了 `check` 執行的內容；白名單限制的是「能執行哪些指令」，不是測試內容，請照常審查接手方的變更。
 
 ## 專案結構
 

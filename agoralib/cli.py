@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
@@ -1282,7 +1282,68 @@ def cmd_recall(ws: Workspace, args):
 
 # ───────────────────────── 其他 ─────────────────────────
 
-DEFAULT_CHECK = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+def project_python(root: Path) -> Optional[Path]:
+    """工作區虛擬環境（.venv 或 venv）的 Python"""
+    rel = Path("Scripts") / "python.exe" if sys.platform.startswith("win") else Path("bin") / "python"
+    return next((root / name / rel for name in (".venv", "venv") if (root / name / rel).is_file()), None)
+
+
+def uses_pytest(root: Path) -> bool:
+    """專案有 pytest 設定：pytest.ini、conftest.py，或 pyproject／setup.cfg／tox.ini 裡的 pytest 區段"""
+    if any((root / f).is_file() for f in ("pytest.ini", "conftest.py", "tests/conftest.py")):
+        return True
+    for name, marker in (("pyproject.toml", "[tool.pytest"), ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+        try:
+            if marker in (root / name).read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def has_module(python: str, module: str) -> bool:
+    code = f"import importlib.util, sys; sys.exit(importlib.util.find_spec({module!r}) is None)"
+    try:
+        return subprocess.run([python, "-c", code], capture_output=True, timeout=60, **quota.NO_WINDOW).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def default_check(root: Path) -> Tuple[Optional[list], str]:
+    """沒有設定 check 時的驗證指令與來源說明：工作區有 .venv／venv 就用它的 Python（否則用 Agora 的）；
+    專案有 pytest 設定、而且那個 Python 裝了 pytest 就跑 pytest，否則有 tests/ 才跑 unittest"""
+    venv = project_python(root)
+    python = str(venv) if venv else sys.executable
+    source = f"自動偵測 {venv.relative_to(root).parts[0]}" if venv else "自動偵測，工作區沒有 .venv／venv，用 Agora 的 Python"
+    pytest_config = uses_pytest(root)
+    if pytest_config and has_module(python, "pytest"):
+        return [python, "-m", "pytest", "-q"], source
+    if pytest_config:
+        source += "；有 pytest 設定但這個 Python 沒有安裝 pytest，改用 unittest"
+    if (root / "tests").is_dir():
+        return [python, "-m", "unittest", "discover", "-s", "tests"], source
+    return None, source
+
+
+def legacy_default_check(spec, venv: Path) -> bool:
+    """舊版 install 寫進設定檔的預設 check：Agora 自己的 Python 跑 unittest，不是專案的虛擬環境"""
+    return (isinstance(spec, list) and spec[1:] == ["-m", "unittest", "discover", "-s", "tests"]
+            and Path(str(spec[0])).resolve() != venv.resolve())
+
+
+def command_python(spec) -> Optional[str]:
+    """指令直接執行的 Python（顯示用）：清單的第一個元素或字串的第一個字是 python 時找出完整路徑"""
+    first = spec[0] if isinstance(spec, list) and spec else None
+    if isinstance(first, list):
+        first = first[0] if first else None
+    if isinstance(spec, str):
+        first = (spec.split() or [None])[0]
+    if not first or not re.match(r"^(python[\d.]*|py)(\.exe)?$", Path(str(first).strip('"')).name.lower()):
+        return None
+    first = str(first).strip('"')
+    return os.path.abspath(first) if Path(first).is_absolute() else (shutil.which(first) or first)
+
+
 AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
 
 
@@ -1344,7 +1405,14 @@ def cmd_build(ws: Workspace, args):
 
 def cmd_check(ws: Workspace, args):
     """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
-    （沒設定時，有 tests/ 才跑 unittest）。建置另用 agora build"""
+    （沒設定時自動偵測，見 default_check）。建置另用 agora build"""
+    check = command_config(ws).get("check")
+    source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
+    if not check:
+        check, source = default_check(ws.root)
+    if check:   # 第一行：實際執行的指令與 Python，方便判斷環境問題
+        python = command_python(check)
+        print(f"驗證指令：{command_label(check)}（Python：{python or '指令未直接指定'}；來源：{source}）")
     files = subprocess.run(["git", "ls-files", "*.py"], cwd=ws.root, capture_output=True, text=True,
                            encoding="utf-8", **quota.NO_WINDOW).stdout.split()
     files += subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "*.py"], cwd=ws.root,
@@ -1361,9 +1429,8 @@ def cmd_check(ws: Workspace, args):
         print(f"語法檢查：{len(files)} 個檔案，{len(errors)} 個錯誤")
     for e in errors:
         print(e)
-    check = command_config(ws).get("check") or (DEFAULT_CHECK if (ws.root / "tests").is_dir() else None)
     if not check:
-        print("未設定 check 指令，也沒有 tests/ 資料夾，略過測試。")
+        print(f"未設定 check 指令，也沒有 tests/ 資料夾，略過測試（{source}）。")
         sys.exit(1 if errors else 0)
     try:
         proc = run_configured_command(check, ws.root)
@@ -1377,7 +1444,7 @@ def cmd_check(ws: Workspace, args):
             in_failure = False
         if in_failure or line.startswith(("Ran ", "OK", "FAILED")):
             keep.append(line)
-    print(f"驗證指令：{command_label(check)}（exit={proc.returncode}）")
+    print(f"驗證結果：exit={proc.returncode}")
     print("\n".join(keep[-120:]) or (proc.stdout + proc.stderr)[-3000:])
     sys.exit(1 if errors or proc.returncode else 0)
 
@@ -1733,7 +1800,7 @@ def cmd_install(ws: Workspace, args):
 
     config_file = config.config_path(ws.root)
     if not config_file.exists():
-        config.save(ws.root, {"check": DEFAULT_CHECK, "parties": {p: {"enabled": True} for p in AI_PARTIES}})
+        config.save(ws.root, {"parties": {p: {"enabled": True} for p in AI_PARTIES}})
         done.append(f"預設設定 → {config_file}（用 agora parties 或 VSCode 擴充套件選擇參與的 AI）")
     enabled = ws.enabled()
 
@@ -1823,6 +1890,28 @@ def cmd_install(ws: Workspace, args):
             print(f"    {t}")
     if "claude" in enabled:
         print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+    for line in check_advice(ws):
+        print(line)
+
+
+def check_advice(ws: Workspace) -> List[str]:
+    """偵測到專案的虛擬環境、check 卻沒設定或用的是 Agora 自己的 Python 時，建議的設定"""
+    venv = project_python(ws.root)
+    current = ws.config().get("check")
+    if not venv or (current and not legacy_default_check(current, venv)):
+        return []
+    suggested, _ = default_check(ws.root)
+    if not suggested:
+        return [f"偵測到虛擬環境 {venv}，但沒有 tests/ 或 pytest 設定；需要驗證時請在 .agora/config.json 設定 check。"]
+    snippet = json.dumps({"check": suggested}, ensure_ascii=False)
+    if current:
+        head = (f"⚠️ .agora/config.json 的 check 用的是 Agora 自己的 Python（{current[0]}），不是專案的 {venv.parent.parent.name}；"
+                f"接手方的 agora check 會在錯的環境跑測試。建議刪除 check 讓它自動偵測，或改成：")
+    else:
+        head = (f"偵測到虛擬環境 {venv.parent.parent.name}：沒有設定 check 時，agora check 會自動用它執行 "
+                f"{command_label(suggested)}。要固定下來，可在 .agora/config.json 加入：")
+    return [head, f"    {snippet}",
+            "build 不會自動偵測；專案需要建置步驟時，另外設定 \"build\"（接手方只能透過 agora build 執行它）。"]
 
 
 EXCLUDE_BEGIN, EXCLUDE_END = "# agora:begin（由 agora install 管理）", "# agora:end"

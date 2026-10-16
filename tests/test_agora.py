@@ -1358,12 +1358,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.10")
+        self.assertEqual(__version__, "0.2.11")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.10", out.getvalue())
+        self.assertIn("0.2.11", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1477,6 +1477,58 @@ class TestBuildAndSandbox(unittest.TestCase):
             self.assertIn("2 個檔案，1 個錯誤", out)
             self.assertIn("bad.py", out)
             self.assertFalse((ws.root / "__pycache__").exists())
+
+    def test_check_uses_project_venv_and_pytest(self):
+        """沒設定 check：工作區有 .venv 就用它的 Python；有 pytest 設定且裝了 pytest 就跑 pytest，第一行印出指令與 Python"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(ws.root / ".venv")], check=True,
+                           capture_output=True, timeout=300)
+            py = cli.project_python(ws.root)
+            self.assertIsNotNone(py)
+            site = subprocess.run([str(py), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            fake = Path(site) / "pytest"   # 假的 pytest：只證明是在 venv 裡、以 pytest 執行
+            fake.mkdir(parents=True)
+            (fake / "__init__.py").write_text("", encoding="utf-8")
+            (fake / "__main__.py").write_text("import sys\nprint('FAKE_PYTEST', sys.prefix, sys.argv[1:])\n",
+                                              encoding="utf-8")
+            (ws.root / "pyproject.toml").write_text("[tool.pytest.ini_options]\naddopts = '-q'\n", encoding="utf-8")
+            (ws.root / "tests").mkdir()
+            (ws.root / "tests" / "test_x.py").write_text("import pytest\n", encoding="utf-8")
+            code, out = self.run_cmd(cli.cmd_check, ws)
+            self.assertEqual(code, 0, out)
+            first = out.splitlines()[0]
+            self.assertIn('"-m", "pytest", "-q"', first)
+            self.assertIn(f"Python：{py}", first)
+            self.assertIn("來源：自動偵測 .venv", first)
+            self.assertIn("FAKE_PYTEST", out)
+            self.assertIn(str(ws.root / ".venv"), out)
+
+            shutil.rmtree(fake)   # venv 沒裝 pytest：用 venv 的 Python 跑 unittest
+            first = self.run_cmd(cli.cmd_check, ws)[1].splitlines()[0]
+            self.assertIn('"-m", "unittest"', first)
+            self.assertIn("沒有安裝 pytest", first)
+
+            config.save(ws.root, {"check": [sys.executable, "-c", "print(1)"]})   # 有設定時照設定
+            first = self.run_cmd(cli.cmd_check, ws)[1].splitlines()[0]
+            self.assertIn("來源：.agora/config.json", first)
+
+    def test_install_suggests_venv_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            venv = ws.root / ".venv" / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
+            venv.parent.mkdir(parents=True)
+            venv.write_bytes(b"")
+            (ws.root / "tests").mkdir()
+            advice = cli.check_advice(ws)
+            self.assertIn("偵測到虛擬環境 .venv", advice[0])
+            self.assertIn(json.dumps(str(venv), ensure_ascii=False)[1:-1], advice[1])
+            # 舊版 install 寫入的預設 check（Agora 自己的 Python）要提醒改掉
+            config.save(ws.root, {"check": [sys.executable, "-m", "unittest", "discover", "-s", "tests"]})
+            self.assertIn("Agora 自己的 Python", cli.check_advice(ws)[0])
+            config.save(ws.root, {"check": [str(venv), "-m", "pytest"]})
+            self.assertEqual(cli.check_advice(ws), [])
 
     def test_check_without_tests_dir_skips_unittest(self):
         with tempfile.TemporaryDirectory() as tmp:
