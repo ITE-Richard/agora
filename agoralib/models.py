@@ -50,7 +50,8 @@ def antigravity_catalog() -> dict:
         error = str(e)
     if not models and not error:
         error = "agy models 沒有回傳任何模型"
-    return {"models": models, "efforts": [], "default": {"model": None, "effort": None},
+    default_model = (quota._read_json(quota.AGY_CACHE) or {}).get("default_model") or (models[0]["id"] if models else None)
+    return {"models": models, "efforts": [], "default": {"model": default_model, "effort": None},
             **({"error": error} if error else {})}
 
 

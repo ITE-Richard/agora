@@ -25,7 +25,7 @@
 只需要 Python 3.9 以上與這個擴充套件：
 
 ```bash
-code --install-extension agora-0.2.13.vsix     # 從 GitHub Release 下載
+code --install-extension agora-0.2.14.vsix     # 從 GitHub Release 下載
 ```
 
 設定 `agora.pythonPath` 保持預設的 `python` 時，擴充套件會自動尋找 Python：PATH 上的 Python（略過 Microsoft Store 的佔位程式）→ 常見安裝位置 → `py` 啟動器。

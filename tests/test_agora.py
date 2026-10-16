@@ -1436,12 +1436,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.13")
+        self.assertEqual(__version__, "0.2.14")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.13", out.getvalue())
+        self.assertIn("0.2.14", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -1500,6 +1500,95 @@ class TestQuotaWindows(unittest.TestCase):
         u2 = {"remaining_pct": 100.0, "resets_at": now + 3600, "updated_at": now}
         self.assertNotIn("，重置", quota.describe("Antigravity", u2))
         self.assertIn("100%", quota.describe("Antigravity", u2))
+
+    def test_antigravity_argon_and_flash_separate_pools(self):
+        status_payload = {
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "defaultOverrideModelConfig": {"modelOrAlias": {"model": "M418"}},
+                    "clientModelSorts": [{
+                        "groups": [{
+                            "modelLabels": [
+                                "Gemini 4 Argon (Medium)",
+                                "Gemini 4 Argon (High)",
+                                "Gemini 3.8 Flash (High)",
+                                "Claude Sonnet 5.5 (High)",
+                            ]
+                        }]
+                    }],
+                    "clientModelConfigs": [
+                        {
+                            "label": "Gemini 3.8 Flash (High)",
+                            "modelId": "gemini-3.8-flash-high",
+                            "modelOrAlias": {"model": "M318"},
+                            "quotaInfo": {"remainingFraction": 1.0, "resetTime": "2026-10-16T19:35:22Z"},
+                        },
+                        {
+                            "label": "Gemini 4 Argon (Medium)",
+                            "modelId": "gemini-4-argon-medium",
+                            "modelOrAlias": {"model": "M418"},
+                            "quotaInfo": {"remainingFraction": 0.412, "resetTime": "2026-10-22T22:48:43Z"},
+                        },
+                        {
+                            "label": "Gemini 4 Argon (High)",
+                            "modelId": "gemini-4-argon-high",
+                            "modelOrAlias": {"model": "M417"},
+                            "quotaInfo": {"remainingFraction": 0.412, "resetTime": "2026-10-22T22:48:43Z"},
+                        },
+                        {
+                            "label": "Claude Sonnet 5.5 (High)",
+                            "modelId": "claude-sonnet-5-5-high",
+                            "modelOrAlias": {"model": "M405"},
+                            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2026-10-16T19:35:22Z"},
+                        },
+                    ],
+                }
+            }
+        }
+        with patch.object(quota, "_candidates", return_value=[{"protocol": "http", "port": 1234, "csrf": "tok"}]), \
+                patch.object(quota, "_request", return_value=json.dumps(status_payload)):
+            queried = quota.query_antigravity()
+        self.assertIsNotNone(queried)
+        self.assertEqual(queried["default_model"], "gemini-4-argon-medium")
+        self.assertIn("gemini-4-argon", queried["pools"])
+        self.assertIn("gemini-3.8-flash", queried["pools"])
+        self.assertIn("claude", queried["pools"])
+        self.assertEqual(queried["pools"]["gemini-4-argon"]["remaining_pct"], 41.2)
+        self.assertEqual(queried["pools"]["gemini-4-argon"]["short_label"], "Argon")
+        self.assertEqual(queried["pools"]["gemini-3.8-flash"]["remaining_pct"], 100.0)
+        self.assertEqual(queried["pools"]["gemini-3.8-flash"]["short_label"], "Flash 3.8")
+
+        future = int(time.time()) + 36000
+        for p in queried["pools"].values():
+            p["resets_at"] = future
+
+        with patch.object(quota, "_read_json", return_value=queried):
+            # 未指定模型時，使用 default_model（gemini-4-argon-medium → Argon 41.2%）
+            with patch.object(quota, "_configured_agy_model", return_value=None):
+                u_def = quota.antigravity_usage()
+                self.assertEqual(u_def["window"], "gemini-4-argon")
+                self.assertEqual(u_def["window_label"], "Argon")
+                self.assertEqual(u_def["remaining_pct"], 41.2)
+                self.assertIn("gemini-4-argon", u_def["windows"])
+                self.assertIn("gemini-3.8-flash", u_def["windows"])
+                self.assertTrue(u_def["windows"]["gemini-4-argon"]["active"])
+                self.assertFalse(u_def["windows"]["gemini-3.8-flash"]["active"])
+
+            # 專案選用 gemini-3.8-flash-high 時，主額度對應 Flash 3.8（100%）
+            with patch.object(quota, "_configured_agy_model", return_value="gemini-3.8-flash-high"):
+                u_flash = quota.antigravity_usage()
+                self.assertEqual(u_flash["window"], "gemini-3.8-flash")
+                self.assertEqual(u_flash["window_label"], "Flash 3.8")
+                self.assertEqual(u_flash["remaining_pct"], 100.0)
+                self.assertTrue(u_flash["windows"]["gemini-3.8-flash"]["active"])
+                self.assertFalse(u_flash["windows"]["gemini-4-argon"]["active"])
+
+            # 專案選用 claude-sonnet-5-5-high 時，主額度對應 Claude（85%）
+            with patch.object(quota, "_configured_agy_model", return_value="claude-sonnet-5-5-high"):
+                u_claude = quota.antigravity_usage()
+                self.assertEqual(u_claude["window"], "claude")
+                self.assertEqual(u_claude["remaining_pct"], 85.0)
+                self.assertIn("claude", u_claude["windows"])
 
 
 class TestBuildAndSandbox(unittest.TestCase):

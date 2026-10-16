@@ -26,14 +26,15 @@
     return d.toDateString() === new Date().toDateString() ? time : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
   }
 
-  function singleQuotaRow(pctVal, resetTs, label, threshold) {
+  function singleQuotaRow(pctVal, resetTs, label, threshold, fullLabel, extraTitle) {
     const pct = Math.max(0, Math.min(100, pctVal));
     const level = pct < threshold ? "low" : pct < 25 ? "mid" : "ok";
     const fill = el("div", { class: `fill ${level}` });
     fill.style.width = `${pct}%`;
     const resetStr = fmtReset(resetTs);
-    const labelPrefix = label ? `${label}：` : "";
-    const title = `${labelPrefix}剩餘 ${pct.toFixed(1)}%，${resetStr} 重置`;
+    const titleLabel = fullLabel || label;
+    const labelPrefix = titleLabel ? `${titleLabel}：` : "";
+    const title = `${labelPrefix}剩餘 ${pct.toFixed(1)}%，${resetStr} 重置${extraTitle || ""}`;
     return el("div", { class: "quota", title },
       label ? el("span", { class: "quota-label" }, label) : null,
       el("div", { class: "bar" }, fill),
@@ -55,21 +56,21 @@
 
   function quotaRows(u, threshold) {
     const winKeys = u.windows ? Object.keys(u.windows) : [];
+    const poolSummary = u.pools
+      ? Object.entries(u.pools).map(([k, v]) => `${v.label || k} ${Math.round(v.remaining_pct)}%`).join("、")
+      : "";
+    const extraTitle = poolSummary ? `（額度池：${poolSummary}）` : "";
     if (winKeys.length > 1) {
       const rows = winKeys.map((k) => {
         const w = u.windows[k];
-        return singleQuotaRow(w.remaining_pct, w.resets_at, w.label || k, threshold);
+        const full = (w.full_label || w.label || k) + (u.pools && w.active ? "（目前模型）" : "");
+        return singleQuotaRow(w.remaining_pct, w.resets_at, w.label || k, threshold, full, extraTitle);
       });
       return el("div", { class: "quota-group" }, ...rows);
     }
     const label = (winKeys.length === 1 && u.windows[winKeys[0]].label) || (u.window_label && u.window ? u.window_label : null);
-    const row = singleQuotaRow(u.remaining_pct, u.resets_at, label, threshold);
-    if (u.pools) {
-      const others = Object.entries(u.pools)
-        .map(([k, v]) => `${v.label || k} ${Math.round(v.remaining_pct)}%`)
-        .join("、");
-      if (others) row.title += `（額度池：${others}）`;
-    }
+    const full = (winKeys.length === 1 && u.windows[winKeys[0]].full_label) || u.label || label;
+    const row = singleQuotaRow(u.remaining_pct, u.resets_at, label, threshold, full, extraTitle);
     return el("div", { class: "quota-group" }, row);
   }
 

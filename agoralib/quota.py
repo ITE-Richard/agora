@@ -345,9 +345,70 @@ def _request(c: dict, path: str, body: bytes | None = None, headers: dict | None
         return r.read().decode("utf-8", errors="replace")
 
 
-def _pool_of(label: str) -> str:
-    label = (label or "").lower()
-    return "claude" if "claude" in label else "gemini" if "gemini" in label else "other"
+_EFFORT_SUFFIX_RE = re.compile(r"\s*\((?:Low|Medium|High|Minimal|Max|XHigh|Thinking)\)\s*$", re.I)
+_ID_EFFORT_SUFFIX_RE = re.compile(r"-(?:low|medium|high|minimal|max|xhigh|thinking)$", re.I)
+
+
+def _family_label(label: str) -> str:
+    """去掉模型顯示名稱尾端的推理強度括號，例如 'Gemini 4 Argon (High)' -> 'Gemini 4 Argon'"""
+    return _EFFORT_SUFFIX_RE.sub("", label or "").strip()
+
+
+def _short_pool_label(family: str) -> str:
+    """窄進度條與摘要用的簡短名稱：例如 'Gemini 4 Argon' -> 'Argon'、'Gemini 3.8 Flash' -> 'Flash 3.8'"""
+    m = re.match(r"^Gemini\s+(\d+(?:\.\d+)?)\s+(.+)$", family or "", re.I)
+    if m:
+        ver, name = m.group(1), m.group(2).strip()
+        return f"{name} {ver}" if "." in ver else name
+    return re.sub(r"^Gemini\s+", "", family or "", flags=re.I).strip() or family
+
+
+def _pool_of(label: str, model_id: str = "") -> str:
+    """模型所屬的額度池代號：
+    - Claude 系列（Opus / Sonnet）共用 'claude'
+    - Gemini 各系列（如 gemini-4-argon、gemini-3.8-flash）各自獨立成池
+    - 其他模型依去強度後的代號分池（無代號時歸入 'other'）"""
+    low = f"{label or ''} {model_id or ''}".lower()
+    if "claude" in low:
+        return "claude"
+    base_id = _ID_EFFORT_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+    if base_id:
+        return base_id
+    fam = _family_label(label).lower()
+    slug = re.sub(r"[^a-z0-9.]+", "-", fam).strip("-")
+    if "gemini" in low:
+        return slug or "gemini"
+    return slug or "other"
+
+
+def _match_agy_pool(pools: dict, target: str | None) -> str | None:
+    """把設定的模型名稱或額度池名稱對應到 pools 的鍵值"""
+    if not target or not pools:
+        return None
+    t = target.strip().lower()
+    if t in pools:
+        return t
+    pk = _pool_of(t, t)
+    if pk in pools:
+        return pk
+    if t != "gemini":
+        for k, v in pools.items():
+            if t in k.lower() or t in (v.get("label") or "").lower() or t in (v.get("short_label") or "").lower():
+                return k
+    return "gemini" if "gemini" in pools else None
+
+
+def _configured_agy_model() -> str | None:
+    """目前工作區設定的 Antigravity 模型（沒設定時回傳 None）"""
+    try:
+        from agoralib import config
+        start = Path(os.getenv("AGORA_WORKSPACE") or os.getcwd()).resolve()
+        root = config.find_root(start)
+        if root:
+            return (config.party_settings(root).get("antigravity") or {}).get("model")
+    except Exception:
+        pass
+    return None
 
 
 def query_antigravity() -> dict | None:
@@ -363,9 +424,21 @@ def query_antigravity() -> dict | None:
             status = json.loads(_request(c, f"{LS_SERVICE}/GetUserStatus", b"{}", {"x-codeium-csrf-token": csrf}))
         except Exception:
             continue
-        configs = ((status.get("userStatus") or {}).get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
+        cmcd = (status.get("userStatus") or {}).get("cascadeModelConfigData") or {}
+        configs = cmcd.get("clientModelConfigs") or []
+        sorts = cmcd.get("clientModelSorts") or []
+        order_labels = (((sorts[0].get("groups") or [{}])[0].get("modelLabels")) or []) if sorts else []
+        order_index = {lbl: i for i, lbl in enumerate(order_labels)}
+        ordered = sorted(configs, key=lambda m: order_index.get(m.get("label"), 999))
+        default_alias = ((cmcd.get("defaultOverrideModelConfig") or {}).get("modelOrAlias") or {}).get("model")
+        default_model = None
+        if default_alias:
+            default_model = next((m.get("modelId") or m.get("label") for m in ordered
+                                  if (m.get("modelOrAlias") or {}).get("model") == default_alias), None)
+        if not default_model and ordered:
+            default_model = ordered[0].get("modelId") or ordered[0].get("label")
         pools = {}
-        for m in configs:
+        for m in ordered:
             q = m.get("quotaInfo") or {}
             if q.get("remainingFraction") is None and not q.get("resetTime"):
                 continue
@@ -373,27 +446,70 @@ def query_antigravity() -> dict | None:
                 reset = int(datetime.fromisoformat(q["resetTime"].replace("Z", "+00:00")).timestamp()) if q.get("resetTime") else None
             except ValueError:
                 reset = None
-            entry = {"label": m.get("label"), "remaining_pct": round(float(q.get("remainingFraction") or 0) * 100, 1),
+            pool = _pool_of(m.get("label") or "", m.get("modelId") or "")
+            fam = "Claude" if pool == "claude" else (_family_label(m.get("label") or "") or pool)
+            entry = {"label": fam, "short_label": _short_pool_label(fam),
+                     "remaining_pct": round(float(q.get("remainingFraction") or 0) * 100, 1),
                      "resets_at": reset}
-            pool = _pool_of(entry["label"])
             if pool not in pools or entry["remaining_pct"] < pools[pool]["remaining_pct"]:
                 pools[pool] = entry
         if pools:
-            return {"updated_at": int(time.time()), "pools": pools}
+            return {"schema": 2, "updated_at": int(time.time()), "default_model": default_model, "pools": pools}
     return None
 
 
-def antigravity_usage() -> dict | None:
-    """讀快取，回傳 agy 預設額度池：{remaining_pct, resets_at, label, pools, window_label, updated_at}"""
+def antigravity_usage(model: str | None = None) -> dict | None:
+    """讀快取，依目前專案選用的模型（或 CLI 預設模型）回傳對應額度池，並附上各 Gemini 系列視窗明細"""
     cache = _read_json(AGY_CACHE)
     if not cache or not cache.get("pools"):
         return None
-    pool = cache["pools"].get(AGY_POOL) or min(cache["pools"].values(), key=lambda p: p["remaining_pct"])
-    if pool.get("resets_at") and pool["resets_at"] < time.time():
-        pool = {**pool, "remaining_pct": 100.0}  # 已過重置時間
-    res = {**pool, "pools": cache["pools"], "updated_at": cache["updated_at"]}
-    res["window_label"] = AGY_POOL
-    return res
+    now = time.time()
+    pools = {}
+    for k, p in cache["pools"].items():
+        if not isinstance(p, dict):
+            continue
+        fam = "Claude" if k == "claude" else (_family_label(p.get("label") or "") or k)
+        entry = {**p, "label": fam, "short_label": p.get("short_label") or _short_pool_label(fam)}
+        if entry.get("resets_at") and entry["resets_at"] < now:
+            entry = {**entry, "remaining_pct": 100.0, "resets_at": None}
+        pools[k] = entry
+    if not pools:
+        return None
+    cfg_model = model or _configured_agy_model()
+    env_pool = os.getenv("AGORA_AGY_POOL")
+    pool_key = (_match_agy_pool(pools, cfg_model)
+                or (_match_agy_pool(pools, env_pool) if env_pool else None)
+                or _match_agy_pool(pools, cache.get("default_model"))
+                or _match_agy_pool(pools, AGY_POOL))
+    if not pool_key:
+        gemini_keys = [k for k in pools if "gemini" in k]
+        pool_key = min(gemini_keys or list(pools), key=lambda k: pools[k]["remaining_pct"])
+    pool = pools[pool_key]
+    win_keys = [k for k in pools if "gemini" in k]
+    if pool_key not in win_keys:
+        win_keys.insert(0, pool_key)
+    windows = {
+        k: {
+            "window": k,
+            "label": pools[k]["short_label"],
+            "full_label": pools[k]["label"],
+            "remaining_pct": pools[k]["remaining_pct"],
+            "resets_at": pools[k].get("resets_at"),
+            "active": k == pool_key,
+        }
+        for k in win_keys
+    }
+    return {
+        **pool,
+        "window": pool_key,
+        "window_label": pool["short_label"],
+        "windows": windows,
+        "pools": pools,
+        "default_model": cache.get("default_model"),
+        "configured_model": cfg_model,
+        "schema": cache.get("schema"),
+        "updated_at": cache.get("updated_at"),
+    }
 
 
 # ───────────────────────── 更新與摘要 ─────────────────────────
@@ -416,7 +532,9 @@ def refresh(force: bool = False, min_interval: int = 60) -> None:
 
 
 def is_stale(usage: dict | None, max_age: int) -> bool:
-    return not usage or time.time() - (usage.get("updated_at") or 0) > max_age
+    if not usage or time.time() - (usage.get("updated_at") or 0) > max_age:
+        return True
+    return "pools" in usage and usage.get("schema") != 2
 
 
 def wanted_max_age(*usages) -> int:
@@ -463,7 +581,13 @@ def describe(name: str, usage: dict | None) -> str:
     if not usage:
         return f"{name}：無資料"
     win_tag = f"{usage['window_label']}，" if usage.get("window_label") and usage.get("window") else ""
-    return (f"{name} 剩 {usage['remaining_pct']:.0f}%（{win_tag}{fmt_time(usage.get('resets_at'))} 重置，"
+    extra = ""
+    if usage.get("pools") and usage.get("windows"):
+        others = [f"{w['label']} 剩 {w['remaining_pct']:.0f}%（{fmt_time(w.get('resets_at'))} 重置）"
+                  for k, w in usage["windows"].items() if k != usage.get("window")]
+        if others:
+            extra = "；" + "、".join(others)
+    return (f"{name} 剩 {usage['remaining_pct']:.0f}%（{win_tag}{fmt_time(usage.get('resets_at'))} 重置{extra}，"
             f"{age_text(usage.get('updated_at'))}）")
 
 
@@ -562,16 +686,17 @@ def main(argv=None):
         print(json.dumps({**usages, "threshold_pct": THRESHOLD_PCT}, ensure_ascii=False, indent=2))
         return
     for party, u in usages.items():
-        label = f"Antigravity（{AGY_POOL}）" if party == "antigravity" else LABELS[party]
-        print(describe(label, u))
-        if party == "antigravity" and u:
-            others = "、".join(f"{k} {v['remaining_pct']:.0f}%" for k, v in u["pools"].items() if k != AGY_POOL)
-            if others:
-                print(f"  其他額度池：{others}")
-        elif u and u.get("windows") and len(u["windows"]) > 1:
-            details = "、".join(f"{w['label']} 剩 {w['remaining_pct']:.0f}%（{fmt_time(w.get('resets_at'))} 重置）"
+        print(describe(LABELS[party], u))
+        if u and u.get("windows") and len(u["windows"]) > 1:
+            details = "、".join(f"{w.get('full_label') or w['label']} 剩 {w['remaining_pct']:.0f}%（{fmt_time(w.get('resets_at'))} 重置）"
                                for w in u["windows"].values())
             print(f"  各視窗明細：{details}")
+        if party == "antigravity" and u and u.get("pools"):
+            shown = set(u.get("windows") or {}) | {u.get("window")}
+            others = "、".join(f"{v.get('label') or k} {v['remaining_pct']:.0f}%"
+                               for k, v in u["pools"].items() if k not in shown)
+            if others:
+                print(f"  其他額度池：{others}")
     for party, u in usages.items():
         if u and u.get("blocked"):
             print(f"⛔ {LABELS[party]} 呼叫失敗需要人工處理：{u['blocked'].get('message') or u['blocked'].get('reason')}")

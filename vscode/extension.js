@@ -503,6 +503,7 @@ class Model {
   async update(args) {
     try {
       this.setParties(await runJson(["parties", ...args, "--json"]));
+      if (args.includes("--model")) this.loadQuota();   // 切換模型可能改變對應的額度池（如 Antigravity 的 Argon / Flash 3.8）
     } catch (e) {
       showError(e);
     }
@@ -1038,6 +1039,7 @@ function activate(context) {
       timer = setTimeout(() => {
         threads.refresh();
         model.loadParties();   // 設定變更，或分派進度改變了近期工作量
+        if (uri && uri.fsPath.endsWith("config.json")) model.loadQuota();
         activity.load();
       }, 300);
     };
